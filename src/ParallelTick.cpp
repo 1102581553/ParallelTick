@@ -12,9 +12,6 @@
 #include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
 #include <mc/entity/systems/ActorLegacyTickSystem.h>
-#include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
-#include <mc/entity/components/ActorTickNeededComponent.h>
-#include <mc/entity/components/ActorOwnerComponent.h>
 
 #include <cmath>
 #include <thread>
@@ -136,11 +133,16 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
+    auto level = ll::service::getLevel();
+    if (!level) {
+        origin(registry);
+        return;
+    }
+
     parallel_tick::ParallelGroups groups;
 
-    registry.view<ActorOwnerComponent>().each([&](auto /*entity*/, ActorOwnerComponent& ownerComp) {
-        Actor* actor = ownerComp.owner;
-        if (!actor) return;
+    for (Actor* actor : level->getRuntimeActorList()) {
+        if (!actor) continue;
 
         bool isDangerous = actor->isPlayer() || actor->isSimulatedPlayer();
         if (conf.parallelItemsOnly
@@ -158,7 +160,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
             groups.phase[color].push_back(actor);
         }
-    });
+    }
 
     if (conf.debug) {
         pt.addStats(
