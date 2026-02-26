@@ -134,7 +134,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    auto* level = ll::service::getLevel();
+    auto level = ll::service::getLevel();
     if (!level) {
         origin(registry);
         return;
