@@ -14,9 +14,8 @@
 #include <mc/entity/components/ActorOwnerComponent.h>
 
 #include <cmath>
-#include <thread>
-#include <vector>
 #include <future>
+#include <vector>
 
 // removeEntity 重载消歧义的类型别名（避免宏参数中出现裸逗号）
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext> (Level::*)(::Actor&);
@@ -92,7 +91,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(region, std::move(entity));
 }
 
-// removeEntity(Actor&)
+// removeEntity(Actor&)：通过类型别名 static_cast 消歧义
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
     ll::memory::HookPriority::Normal,
@@ -105,7 +104,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(actor);
 }
 
-// removeEntity(WeakEntityRef)
+// removeEntity(WeakEntityRef)：通过类型别名 static_cast 消歧义
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelRemoveWeakRefLock,
     ll::memory::HookPriority::Normal,
@@ -119,6 +118,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 }
 
 // --- 并行派发核心 Hook ---
+// 不使用 BDS TaskGroup（TaskStartInfo/TaskResult 构造函数和静态方法均未公开导出），
+// 改用 std::async 实现并行。
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelTickDispatchHook,
     ll::memory::HookPriority::Normal,
@@ -135,7 +136,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 通过 entt view 遍历需要 tick 的实体
+    // 通过 entt view 遍历带有 ActorOwnerComponent + ActorTickNeededComponent 的实体
     parallel_tick::ParallelGroups groups;
     auto view = registry.mRegistry.view<ActorOwnerComponent, ActorTickNeededComponent>();
 
@@ -170,8 +171,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         );
     }
 
-    // 使用 std::async 进行并行派发
-    // 避免依赖 TaskGroup/TaskStartInfo/TaskResult（其构造函数未公开导出）
+    // 四色并行：同一 phase 内的实体空间不相邻，可以安全并行
+    // 不同 phase 之间串行执行，保证相邻 cell 不会同时 tick
     for (int p = 0; p < 4; ++p) {
         auto& list = groups.phase[p];
         if (list.empty()) continue;
@@ -202,7 +203,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         }
     }
 
-    // 串行阶段：unsafe 实体在主线程 tick
+    // 串行阶段：unsafe 实体（玩家等）在主线程 tick
     for (auto* actor : groups.unsafe) {
         if (actor) {
             actor->normalTick();
