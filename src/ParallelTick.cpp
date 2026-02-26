@@ -10,7 +10,7 @@
 #include <mc/entity/systems/ActorLegacyTickSystem.h>
 #include <mc/deps/core/threading/TaskGroup.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
-#include <mc/world/actor/ActorTickNeededComponent.h>
+#include <mc/entity/components/ActorTickNeededComponent.h>
 
 namespace parallel_tick {
 
