@@ -118,6 +118,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 }
 
 // --- 并行派发核心 Hook ---
+#pragma warning(push)
+#pragma warning(disable: 4996)
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelTickDispatchHook,
     ll::memory::HookPriority::Normal,
@@ -134,32 +136,28 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    auto level = ll::service::getLevel();
-    if (!level) {
-        origin(registry);
-        return;
-    }
-
     parallel_tick::ParallelGroups groups;
 
-    level->forEachActor([&](Actor& actor) -> bool {
-        bool isDangerous = actor.isPlayer() || actor.isSimulatedPlayer();
+    registry.view<ActorOwnerComponent>().each([&](auto /*entity*/, ActorOwnerComponent& ownerComp) {
+        Actor* actor = ownerComp.owner;
+        if (!actor) return;
+
+        bool isDangerous = actor->isPlayer() || actor->isSimulatedPlayer();
         if (conf.parallelItemsOnly
-            && actor.getEntityTypeId() != ActorType::ItemEntity
-            && actor.getEntityTypeId() != ActorType::Experience) {
+            && actor->getEntityTypeId() != ActorType::ItemEntity
+            && actor->getEntityTypeId() != ActorType::Experience) {
             isDangerous = true;
         }
 
         if (isDangerous) {
-            groups.unsafe.push_back(&actor);
+            groups.unsafe.push_back(actor);
         } else {
-            auto const& pos = actor.getPosition();
+            auto const& pos = actor->getPosition();
             int gx = static_cast<int>(std::floor(pos.x / conf.gridSize));
             int gz = static_cast<int>(std::floor(pos.z / conf.gridSize));
             int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
-            groups.phase[color].push_back(&actor);
+            groups.phase[color].push_back(actor);
         }
-        return true;
     });
 
     if (conf.debug) {
@@ -207,5 +205,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         }
     }
 }
+#pragma warning(pop)
 
 LL_REGISTER_MOD(parallel_tick::ParallelTick, parallel_tick::ParallelTick::getInstance());
