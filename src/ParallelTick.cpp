@@ -6,12 +6,12 @@
 #include <ll/api/mod/RegisterHelper.h>
 
 #include <mc/world/level/Level.h>
+#include <mc/server/ServerLevel.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorType.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
 #include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
-#include <mc/entity/systems/ActorLegacyTickSystem.h>
 
 #include <cmath>
 #include <thread>
@@ -115,50 +115,49 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 }
 
 // --- 并行派发核心 Hook ---
+// Hook ServerLevel::$tickEntities，这是专门负责 tick 所有实体的函数
+// 符号为 MCAPI，链接不会失败
 #pragma warning(push)
 #pragma warning(disable: 4996)
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelTickDispatchHook,
     ll::memory::HookPriority::Normal,
-    ActorLegacyTickSystem,
-    &ActorLegacyTickSystem::$tick,
-    void,
-    EntityRegistry& registry
+    ServerLevel,
+    &ServerLevel::$tickEntities,
+    void
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
 
     if (!conf.enabled) {
-        origin(registry);
+        origin();
         return;
     }
 
-    auto level = ll::service::getLevel();
-    if (!level) {
-        origin(registry);
-        return;
-    }
-
+    // getRuntimeActorList() 直接从 this 调用，不需要 ll::service::getLevel()
     parallel_tick::ParallelGroups groups;
 
-    for (Actor* actor : level->getRuntimeActorList()) {
-        if (!actor) continue;
+    {
+        std::shared_lock lock(pt.getLifecycleMutex());
+        for (Actor* actor : this->getRuntimeActorList()) {
+            if (!actor) continue;
 
-        bool isDangerous = actor->isPlayer() || actor->isSimulatedPlayer();
-        if (conf.parallelItemsOnly
-            && actor->getEntityTypeId() != ActorType::ItemEntity
-            && actor->getEntityTypeId() != ActorType::Experience) {
-            isDangerous = true;
-        }
+            bool isDangerous = actor->isPlayer() || actor->isSimulatedPlayer();
+            if (conf.parallelItemsOnly
+                && actor->getEntityTypeId() != ActorType::ItemEntity
+                && actor->getEntityTypeId() != ActorType::Experience) {
+                isDangerous = true;
+            }
 
-        if (isDangerous) {
-            groups.unsafe.push_back(actor);
-        } else {
-            auto const& pos = actor->getPosition();
-            int gx = static_cast<int>(std::floor(pos.x / conf.gridSize));
-            int gz = static_cast<int>(std::floor(pos.z / conf.gridSize));
-            int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
-            groups.phase[color].push_back(actor);
+            if (isDangerous) {
+                groups.unsafe.push_back(actor);
+            } else {
+                auto const& pos = actor->getPosition();
+                int gx    = static_cast<int>(std::floor(pos.x / conf.gridSize));
+                int gz    = static_cast<int>(std::floor(pos.z / conf.gridSize));
+                int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
+                groups.phase[color].push_back(actor);
+            }
         }
     }
 
@@ -170,7 +169,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         );
     }
 
-    // 并行阶段
+    // 并行阶段（同色格子间无空间相邻，可以安全并行）
     for (int p = 0; p < 4; ++p) {
         auto& list = groups.phase[p];
         if (list.empty()) continue;
@@ -187,24 +186,18 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                     std::shared_lock lock(pt.getLifecycleMutex());
                     for (size_t j = 0; j < batchCount; ++j) {
                         Actor* actor = batchBegin[j];
-                        if (actor) {
-                            actor->normalTick();
-                        }
+                        if (actor) actor->normalTick();
                     }
                 }
             ));
         }
 
-        for (auto& f : futures) {
-            f.get();
-        }
+        for (auto& f : futures) f.get();
     }
 
-    // 串行阶段
+    // 串行阶段（玩家、模拟玩家等需要主线程的实体）
     for (auto* actor : groups.unsafe) {
-        if (actor) {
-            actor->normalTick();
-        }
+        if (actor) actor->normalTick();
     }
 }
 #pragma warning(pop)
