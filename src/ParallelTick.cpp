@@ -186,10 +186,25 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                     std::shared_lock lock(pt.getLifecycleMutex());
                     for (size_t j = 0; j < batchCount; ++j) {
                         Actor* actor = batchBegin[j];
-                        if (actor) actor->normalTick();
+                        if (!actor) continue;
+                        
+                        // 崩溃前最后输出的就是问题实体
+                        auto typeId   = (int)actor->getEntityTypeId();
+                        auto entityId = actor->getRuntimeID().rawID;
+                        
+                        parallel_tick::ParallelTick::getInstance().getSelf().getLogger().debug(
+                            "Ticking entity: typeId={} runtimeId={}", typeId, entityId
+                        );
+                        
+                        actor->normalTick();
+                        
+                        parallel_tick::ParallelTick::getInstance().getSelf().getLogger().debug(
+                            "Done entity: typeId={} runtimeId={}", typeId, entityId
+                        );
                     }
                 }
             ));
+
         }
 
         for (auto& f : futures) f.get();
