@@ -1,11 +1,20 @@
 #pragma once
 #include <ll/api/mod/NativeMod.h>
 #include <ll/api/io/Logger.h>
-#include <mutex>
+#include <shared_mutex>
 #include <atomic>
+#include <vector>
 #include "Config.h"
 
+// Forward declarations
+class Actor;
+
 namespace parallel_tick {
+
+struct ParallelGroups {
+    std::vector<Actor*> phase[4];
+    std::vector<Actor*> unsafe;
+};
 
 class ParallelTick {
 public:
@@ -20,9 +29,8 @@ public:
     bool disable();
 
     Config& getConfig() { return mConfig; }
-    std::mutex& getLifecycleMutex() { return mLifecycleMutex; }
-    
-    // 统计相关
+    std::shared_mutex& getLifecycleMutex() { return mLifecycleMutex; }
+
     void addStats(int p0, int p1, int p2, int p3, int u) {
         mPhaseStats[0] += p0; mPhaseStats[1] += p1;
         mPhaseStats[2] += p2; mPhaseStats[3] += p3;
@@ -35,12 +43,11 @@ private:
 
     ll::mod::NativeMod& mSelf;
     Config mConfig;
-    std::mutex mLifecycleMutex;
-    
-    // 调试统计变量
+    std::shared_mutex mLifecycleMutex; // shared_mutex: 并行tick持读锁，生命周期操作持写锁
+
     std::atomic<size_t> mPhaseStats[4] = {0, 0, 0, 0};
     std::atomic<size_t> mUnsafeStats = 0;
-    bool mDebugTaskRunning = false;
+    std::atomic<bool> mDebugTaskRunning = false; // 修复：改为 atomic
 };
 
 } // namespace parallel_tick
