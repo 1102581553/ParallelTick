@@ -8,16 +8,17 @@
 #include <mc/world/level/Level.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorType.h>
+#include <mc/entity/EntityContext.h>
 #include <mc/entity/systems/ActorLegacyTickSystem.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
 #include <mc/entity/components/ActorTickNeededComponent.h>
 #include <mc/entity/components/ActorOwnerComponent.h>
 
 #include <cmath>
-#include <future>
+#include <thread>
 #include <vector>
+#include <future>
 
-// removeEntity 重载消歧义的类型别名（避免宏参数中出现裸逗号）
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext> (Level::*)(::Actor&);
 using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntityRef);
 
@@ -77,7 +78,6 @@ bool ParallelTick::disable() {
 
 // --- 生命周期写锁 Hooks ---
 
-// addEntity：单一重载，直接引用 thunk
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelAddEntityLock,
     ll::memory::HookPriority::Normal,
@@ -91,7 +91,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(region, std::move(entity));
 }
 
-// removeEntity(Actor&)：通过类型别名 static_cast 消歧义
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
     ll::memory::HookPriority::Normal,
@@ -104,7 +103,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(actor);
 }
 
-// removeEntity(WeakEntityRef)：通过类型别名 static_cast 消歧义
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelRemoveWeakRefLock,
     ll::memory::HookPriority::Normal,
@@ -118,8 +116,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 }
 
 // --- 并行派发核心 Hook ---
-// 不使用 BDS TaskGroup（TaskStartInfo/TaskResult 构造函数和静态方法均未公开导出），
-// 改用 std::async 实现并行。
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelTickDispatchHook,
     ll::memory::HookPriority::Normal,
@@ -136,7 +132,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 通过 entt view 遍历带有 ActorOwnerComponent + ActorTickNeededComponent 的实体
     parallel_tick::ParallelGroups groups;
     auto view = registry.mRegistry.view<ActorOwnerComponent, ActorTickNeededComponent>();
 
@@ -171,8 +166,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         );
     }
 
-    // 四色并行：同一 phase 内的实体空间不相邻，可以安全并行
-    // 不同 phase 之间串行执行，保证相邻 cell 不会同时 tick
+    // 并行阶段：使用 std::async 避免依赖未导出的 TaskStartInfo/TaskResult
     for (int p = 0; p < 4; ++p) {
         auto& list = groups.phase[p];
         if (list.empty()) continue;
@@ -180,7 +174,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         std::vector<std::future<void>> futures;
 
         for (size_t i = 0; i < list.size(); i += conf.batchSize) {
-            size_t end        = std::min(i + static_cast<size_t>(conf.batchSize), list.size());
+            size_t  end        = std::min(i + static_cast<size_t>(conf.batchSize), list.size());
             Actor** batchBegin = list.data() + i;
             size_t  batchCount = end - i;
 
@@ -197,13 +191,12 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             ));
         }
 
-        // 等待当前 phase 所有 batch 完成后再进入下一个 phase
         for (auto& f : futures) {
             f.get();
         }
     }
 
-    // 串行阶段：unsafe 实体（玩家等）在主线程 tick
+    // 串行阶段
     for (auto* actor : groups.unsafe) {
         if (actor) {
             actor->normalTick();
