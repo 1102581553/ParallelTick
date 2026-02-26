@@ -6,7 +6,6 @@
 #include <vector>
 #include "Config.h"
 
-// Forward declarations
 class Actor;
 
 namespace parallel_tick {
@@ -43,11 +42,11 @@ private:
 
     ll::mod::NativeMod& mSelf;
     Config mConfig;
-    std::shared_mutex mLifecycleMutex; // shared_mutex: 并行tick持读锁，生命周期操作持写锁
+    std::shared_mutex mLifecycleMutex;
 
     std::atomic<size_t> mPhaseStats[4] = {0, 0, 0, 0};
     std::atomic<size_t> mUnsafeStats = 0;
-    std::atomic<bool> mDebugTaskRunning = false; // 修复：改为 atomic
+    std::atomic<bool> mDebugTaskRunning = false;
 };
 
 } // namespace parallel_tick
