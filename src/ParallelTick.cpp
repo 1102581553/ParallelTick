@@ -9,6 +9,8 @@
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorType.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
+#include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
+
 #include <mc/entity/systems/ActorLegacyTickSystem.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
 #include <mc/entity/components/ActorTickNeededComponent.h>
