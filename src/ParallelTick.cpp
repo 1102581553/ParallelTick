@@ -7,11 +7,20 @@
 
 #include <mc/world/level/Level.h>
 #include <mc/world/actor/Actor.h>
+#include <mc/world/actor/ActorType.h>
 #include <mc/entity/systems/ActorLegacyTickSystem.h>
-#include <mc/deps/core/threading/TaskGroup.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
 #include <mc/entity/components/ActorTickNeededComponent.h>
 #include <mc/entity/components/ActorOwnerComponent.h>
+
+#include <cmath>
+#include <thread>
+#include <vector>
+#include <future>
+
+// removeEntity 重载消歧义的类型别名（避免宏参数中出现裸逗号）
+using LevelRemoveByActor   = ::OwnerPtr<::EntityContext> (Level::*)(::Actor&);
+using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntityRef);
 
 namespace parallel_tick {
 
@@ -68,24 +77,56 @@ bool ParallelTick::disable() {
 } // namespace parallel_tick
 
 // --- 生命周期写锁 Hooks ---
-LL_AUTO_TYPE_INSTANCE_HOOK(ParallelAddEntityLock, ll::memory::HookPriority::Normal, Level, &Level::addEntity,
-    Actor*, BlockSource& region, OwnerPtr<EntityContext> entity) {
+
+// addEntity：单一重载，直接引用 thunk
+LL_AUTO_TYPE_INSTANCE_HOOK(
+    ParallelAddEntityLock,
+    ll::memory::HookPriority::Normal,
+    Level,
+    &Level::$addEntity,
+    ::Actor*,
+    ::BlockSource& region,
+    ::OwnerPtr<::EntityContext> entity
+) {
     std::unique_lock lock(parallel_tick::ParallelTick::getInstance().getLifecycleMutex());
     return origin(region, std::move(entity));
 }
 
-LL_AUTO_TYPE_INSTANCE_HOOK(ParallelRemoveEntityLock, ll::memory::HookPriority::Normal, Level,
-    "?removeEntity@Level@@UEAA?AV?$OwnerPtr@VEntityContext@@@@AEAVActor@@@Z",
-    OwnerPtr<EntityContext>, Actor& actor) {
+// removeEntity(Actor&)
+LL_AUTO_TYPE_INSTANCE_HOOK(
+    ParallelRemoveActorLock,
+    ll::memory::HookPriority::Normal,
+    Level,
+    static_cast<LevelRemoveByActor>(&Level::$removeEntity),
+    ::OwnerPtr<::EntityContext>,
+    ::Actor& actor
+) {
     std::unique_lock lock(parallel_tick::ParallelTick::getInstance().getLifecycleMutex());
     return origin(actor);
 }
 
-// --- 并行派发核心 Hook ---
-LL_AUTO_TYPE_INSTANCE_HOOK(ParallelTickDispatchHook, ll::memory::HookPriority::Normal,
-    ActorLegacyTickSystem, &ActorLegacyTickSystem::$tick,
-    void, EntityRegistry& registry) {
+// removeEntity(WeakEntityRef)
+LL_AUTO_TYPE_INSTANCE_HOOK(
+    ParallelRemoveWeakRefLock,
+    ll::memory::HookPriority::Normal,
+    Level,
+    static_cast<LevelRemoveByWeakRef>(&Level::$removeEntity),
+    ::OwnerPtr<::EntityContext>,
+    ::WeakEntityRef entityRef
+) {
+    std::unique_lock lock(parallel_tick::ParallelTick::getInstance().getLifecycleMutex());
+    return origin(std::move(entityRef));
+}
 
+// --- 并行派发核心 Hook ---
+LL_AUTO_TYPE_INSTANCE_HOOK(
+    ParallelTickDispatchHook,
+    ll::memory::HookPriority::Normal,
+    ActorLegacyTickSystem,
+    &ActorLegacyTickSystem::$tick,
+    void,
+    EntityRegistry& registry
+) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
 
@@ -105,8 +146,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(ParallelTickDispatchHook, ll::memory::HookPriority::N
 
         bool isDangerous = actor->isPlayer() || actor->isSimulatedPlayer();
         if (conf.parallelItemsOnly
-            && actor->getEntityTypeId() != ActorType::Item
-            && actor->getEntityTypeId() != ActorType::ExperienceOrb) {
+            && actor->getEntityTypeId() != ActorType::ItemEntity
+            && actor->getEntityTypeId() != ActorType::Experience) {
             isDangerous = true;
         }
 
@@ -122,39 +163,43 @@ LL_AUTO_TYPE_INSTANCE_HOOK(ParallelTickDispatchHook, ll::memory::HookPriority::N
     }
 
     if (conf.debug) {
-        pt.addStats((int)groups.phase[0].size(), (int)groups.phase[1].size(),
-                    (int)groups.phase[2].size(), (int)groups.phase[3].size(),
-                    (int)groups.unsafe.size());
+        pt.addStats(
+            (int)groups.phase[0].size(), (int)groups.phase[1].size(),
+            (int)groups.phase[2].size(), (int)groups.phase[3].size(),
+            (int)groups.unsafe.size()
+        );
     }
 
-    Level* level = ll::service::getLevel();
-    if (!level) { origin(registry); return; }
-    TaskGroup& taskGroup = level->getSyncTasksGroup();
-
-    // 并行阶段：持读锁
+    // 使用 std::async 进行并行派发
+    // 避免依赖 TaskGroup/TaskStartInfo/TaskResult（其构造函数未公开导出）
     for (int p = 0; p < 4; ++p) {
         auto& list = groups.phase[p];
         if (list.empty()) continue;
 
-        for (size_t i = 0; i < list.size(); i += conf.batchSize) {
-            size_t end = std::min(i + (size_t)conf.batchSize, list.size());
-            // 用 span 避免拷贝 vector
-            auto batchBegin = list.data() + i;
-            auto batchSize  = end - i;
+        std::vector<std::future<void>> futures;
 
-            taskGroup.queueSync_DEPRECATED(TaskStartInfo{}, [&pt, batchBegin, batchSize]() -> TaskResult {
-                std::shared_lock lock(pt.getLifecycleMutex());
-                for (size_t j = 0; j < batchSize; ++j) {
-                    Actor* actor = batchBegin[j];
-                    if (actor) {
-                        actor->normalTick();
+        for (size_t i = 0; i < list.size(); i += conf.batchSize) {
+            size_t end        = std::min(i + static_cast<size_t>(conf.batchSize), list.size());
+            Actor** batchBegin = list.data() + i;
+            size_t  batchCount = end - i;
+
+            futures.push_back(std::async(std::launch::async,
+                [&pt, batchBegin, batchCount]() {
+                    std::shared_lock lock(pt.getLifecycleMutex());
+                    for (size_t j = 0; j < batchCount; ++j) {
+                        Actor* actor = batchBegin[j];
+                        if (actor) {
+                            actor->normalTick();
+                        }
                     }
                 }
-                return {};
-            });
+            ));
         }
-        // 等待当前 phase 的所有任务完成，再进入下一个 phase
-        taskGroup.sync_DEPRECATED_ASK_TOMMO([](){});
+
+        // 等待当前 phase 所有 batch 完成后再进入下一个 phase
+        for (auto& f : futures) {
+            f.get();
+        }
     }
 
     // 串行阶段：unsafe 实体在主线程 tick
