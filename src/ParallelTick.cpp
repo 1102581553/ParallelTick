@@ -59,11 +59,13 @@ bool ParallelTick::load() {
 }
 
 bool ParallelTick::enable() {
+    registerHooks();
     if (mConfig.debug) startDebugTask();
     return true;
 }
 
 bool ParallelTick::disable() {
+    unregisterHooks();
     stopDebugTask();
     return true;
 }
@@ -222,7 +224,7 @@ LL_TYPE_INSTANCE_HOOK(
 
 // --- 注册/注销 ---
 
-void registerHooks() {
+void parallel_tick::registerHooks() {
     ParallelAddEntityLock::hook();
     ParallelRemoveActorLock::hook();
     ParallelRemoveWeakRefLock::hook();
@@ -230,7 +232,7 @@ void registerHooks() {
     ParallelLevelTickHook::hook();
 }
 
-void unregisterHooks() {
+void parallel_tick::unregisterHooks() {
     ParallelAddEntityLock::unhook();
     ParallelRemoveActorLock::unhook();
     ParallelRemoveWeakRefLock::unhook();
