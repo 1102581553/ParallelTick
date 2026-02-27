@@ -8,8 +8,6 @@
 #include <vector>
 #include <cstdio>
 
-// SEH 包装：必须是独立的非内联函数，内部不能有任何 C++ 析构对象
-// 返回 0 表示正常，非 0 为 SEH 异常码
 static int invokeWithSEH(std::function<void()>& f) {
     __try {
         f();
@@ -28,8 +26,7 @@ public:
             struct Param { FixedThreadPool* pool; };
             auto* param = new Param{this};
             HANDLE h = CreateThread(
-                nullptr,
-                stackSize,
+                nullptr, stackSize,
                 [](LPVOID p) -> DWORD {
                     auto* param = static_cast<Param*>(p);
                     param->pool->workerLoop();
@@ -80,16 +77,12 @@ private:
                 task = std::move(mTasks.front());
                 mTasks.pop();
             }
-
-            // SEH 捕获硬件异常（0xC0000005 等），工作线程不崩溃
             int exCode = invokeWithSEH(task);
             if (exCode != 0) {
                 fprintf(stderr,
-                    "[FixedThreadPool] SEH exception 0x%08X in task\n",
+                    "[FixedThreadPool] SEH 0x%08X in task\n",
                     static_cast<unsigned>(exCode));
             }
-
-            // 无论成功或异常都递减，防止 waitAll 永久阻塞
             if (--mPending == 0) {
                 std::lock_guard<std::mutex> lock(mDoneMutex);
                 mDoneCv.notify_all();
