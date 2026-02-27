@@ -17,25 +17,49 @@ jobs:
         with:
           xmake-version: latest
 
-      # 正确缓存 xmake 包目录（Windows 专用路径）
+      # 获取 xmake 版本，用于缓存键
+      - name: Get xmake version
+        id: xmake_version
+        run: |
+          $version = & xmake --version | Select-String -Pattern "xmake v(\d+\.\d+\.\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      # 确保缓存路径存在（避免缓存失败）
+      - name: Ensure cache directories exist
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\.xmake"
+          New-Item -ItemType Directory -Force -Path "build"
+        shell: pwsh
+
+      # 缓存 xmake 包（依赖）
       - name: Cache xmake packages
         uses: actions/cache@v5
-        id: cache-xmake
+        id: cache-packages
         with:
-          path: |
-            ${{ env.LOCALAPPDATA }}\.xmake
-            build
-          key: ${{ runner.os }}-xmake-${{ hashFiles('xmake.lua') }}-${{ github.sha }}
+          path: ${{ env.LOCALAPPDATA }}\.xmake
+          key: ${{ runner.os }}-${{ runner.arch }}-xmake-${{ steps.xmake_version.outputs.version }}-packages-${{ hashFiles('xmake.lua') }}
           restore-keys: |
-            ${{ runner.os }}-xmake-${{ hashFiles('xmake.lua') }}-
-            ${{ runner.os }}-xmake-
+            ${{ runner.os }}-${{ runner.arch }}-xmake-${{ steps.xmake_version.outputs.version }}-packages-
+            ${{ runner.os }}-${{ runner.arch }}-xmake-
 
-      # 可选：查看缓存命中情况
+      # 缓存构建中间文件（加速编译）
+      - name: Cache build output
+        uses: actions/cache@v5
+        id: cache-build
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-build-
+
+      # 显示缓存命中状态
       - name: Check cache status
-        if: steps.cache-xmake.outputs.cache-hit != 'true'
-        run: echo "Cache miss, will download dependencies."
+        run: |
+          echo "Packages cache hit: ${{ steps.cache-packages.outputs.cache-hit }}"
+          echo "Build cache hit: ${{ steps.cache-build.outputs.cache-hit }}"
 
-      # 配置项目（如果缓存命中，跳过依赖下载/编译）
+      # 配置项目
       - name: Configure
         run: xmake f -a x64 -m release -p windows -y
 
