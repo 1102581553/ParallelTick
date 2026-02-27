@@ -46,7 +46,6 @@ public:
         mLiveActors.insert(actor);
     }
 
-    // 实体被删除时，从存活集合移除
     void onActorRemoved(Actor* actor) {
         std::lock_guard lock(mQueueMutex);
         mLiveActors.erase(actor);
@@ -57,9 +56,14 @@ public:
         return mLiveActors.count(actor) > 0;
     }
 
-    std::vector<ActorTickEntry> takeQueue() {
+    void clearLive() {
         std::lock_guard lock(mQueueMutex);
         mLiveActors.clear();
+    }
+
+    // takeQueue 只取走队列，mLiveActors 保留到 clearLive() 调用
+    std::vector<ActorTickEntry> takeQueue() {
+        std::lock_guard lock(mQueueMutex);
         return std::move(mPendingQueue);
     }
 
@@ -84,7 +88,7 @@ private:
     std::atomic<bool>               mCollecting{false};
     std::mutex                      mQueueMutex;
     std::vector<ActorTickEntry>     mPendingQueue;
-    std::unordered_set<Actor*>      mLiveActors;  // 收集期间存活的 actor
+    std::unordered_set<Actor*>      mLiveActors;
 
     std::atomic<size_t>             mPhaseStats[4] = {0, 0, 0, 0};
     std::atomic<size_t>             mUnsafeStats   = 0;
