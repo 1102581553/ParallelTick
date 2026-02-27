@@ -123,6 +123,12 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
 
+    // 临时：无条件打印，确认 hook 是否生效
+    pt.getSelf().getLogger().info(
+        "NormalTick hook hit, collecting={}, isPlayer={}",
+        pt.isCollecting(), this->isPlayer()
+    );
+
     if (!conf.enabled || !pt.isCollecting()) {
         origin();
         return;
@@ -146,7 +152,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     void
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
-    auto  conf = pt.getConfig(); // 值拷贝，线程安全
+    auto  conf = pt.getConfig();
 
     if (!conf.enabled) {
         origin();
@@ -165,7 +171,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
     if (list.empty()) return;
 
-    // 按棋盘格分组
     struct Groups { std::vector<Actor*> phase[4]; } groups;
 
     for (Actor* actor : list) {
