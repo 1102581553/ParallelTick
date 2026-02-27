@@ -9,20 +9,12 @@
 #include <cstdio>
 #include <exception>
 
-// ================================================================
-// SEH 过滤器：关键修复
-//
-// 0xE06D7363 = MSVC C++ 异常的 SEH 代码
-// 必须让它穿透 __except，由外层 C++ try-catch 正确处理
-// 否则栈展开被跳过 → 析构函数不跑 → 状态损坏
-// ================================================================
 static LONG sehFilterNoCpp(unsigned int code) {
-    if (code == 0xE06D7363u)          // C++ 异常 → 不拦截
+    if (code == 0xE06D7363u)
         return EXCEPTION_CONTINUE_SEARCH;
-    return EXCEPTION_EXECUTE_HANDLER;  // 硬件异常 → 拦截
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// SEH 安全调用（只捕获硬件异常，不捕获 C++ 异常）
 static int invokeWithSEH(std::function<void()>& f) {
     __try {
         f();
@@ -32,7 +24,6 @@ static int invokeWithSEH(std::function<void()>& f) {
     }
 }
 
-// 完整安全调用（SEH + C++ 异常）
 static int invokeFullySafe(std::function<void()>& f) {
     try {
         return invokeWithSEH(f);
@@ -119,11 +110,10 @@ private:
                 task = std::move(mTasks.front());
                 mTasks.pop();
             }
-            // 使用完整安全调用：C++ 异常走 try-catch 正常展开
             int exCode = invokeFullySafe(task);
             if (exCode != 0) {
                 fprintf(stderr,
-                    "[FixedThreadPool] Task failed with code 0x%08X\n",
+                    "[FixedThreadPool] Task failed code 0x%08X\n",
                     static_cast<unsigned>(exCode));
             }
             if (mPending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
