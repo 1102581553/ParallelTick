@@ -4,22 +4,21 @@
 #include <shared_mutex>
 #include <atomic>
 #include <vector>
+#include <mutex>
 #include "Config.h"
+#include "FixedThreadPool.h"
 
 class Actor;
 
 namespace parallel_tick {
 
-struct ParallelGroups {
-    std::vector<Actor*> phase[4];
-    std::vector<Actor*> unsafe;
-};
-
 class ParallelTick {
 public:
     static ParallelTick& getInstance();
 
-    ParallelTick() : mSelf(*ll::mod::NativeMod::current()) {}
+    ParallelTick()
+    : mSelf(*ll::mod::NativeMod::current()),
+      mPool(std::max(1u, std::thread::hardware_concurrency() - 1)) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
@@ -27,26 +26,45 @@ public:
     bool enable();
     bool disable();
 
-    Config& getConfig() { return mConfig; }
-    std::shared_mutex& getLifecycleMutex() { return mLifecycleMutex; }
+    Config&            getConfig()          { return mConfig; }
+    std::shared_mutex& getLifecycleMutex()  { return mLifecycleMutex; }
+    FixedThreadPool&   getPool()            { return mPool; }
+
+    void collectActor(Actor* actor) {
+        std::lock_guard lock(mQueueMutex);
+        mPendingQueue.push_back(actor);
+    }
+
+    std::vector<Actor*> takeQueue() {
+        std::lock_guard lock(mQueueMutex);
+        return std::move(mPendingQueue);
+    }
+
+    bool isCollecting() const { return mCollecting.load(); }
+    void setCollecting(bool v) { mCollecting.store(v); }
 
     void addStats(int p0, int p1, int p2, int p3, int u) {
         mPhaseStats[0] += p0; mPhaseStats[1] += p1;
         mPhaseStats[2] += p2; mPhaseStats[3] += p3;
-        mUnsafeStats += u;
+        mUnsafeStats   += u;
     }
 
 private:
     void startDebugTask();
     void stopDebugTask();
 
-    ll::mod::NativeMod& mSelf;
-    Config mConfig;
-    std::shared_mutex mLifecycleMutex;
+    ll::mod::NativeMod&  mSelf;
+    Config               mConfig;
+    std::shared_mutex    mLifecycleMutex;
+    FixedThreadPool      mPool;
 
-    std::atomic<size_t> mPhaseStats[4] = {0, 0, 0, 0};
-    std::atomic<size_t> mUnsafeStats = 0;
-    std::atomic<bool> mDebugTaskRunning = false;
+    std::atomic<bool>    mCollecting{false};
+    std::mutex           mQueueMutex;
+    std::vector<Actor*>  mPendingQueue;
+
+    std::atomic<size_t>  mPhaseStats[4] = {0, 0, 0, 0};
+    std::atomic<size_t>  mUnsafeStats   = 0;
+    std::atomic<bool>    mDebugTaskRunning{false};
 };
 
 } // namespace parallel_tick
