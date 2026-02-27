@@ -69,9 +69,13 @@ bool ParallelTick::load() {
     auto path = getSelf().getConfigDir() / "config.json";
     if (!ll::config::loadConfig(mConfig, path))
         ll::config::saveConfig(mConfig, path);
-    getSelf().getLogger().info("[{}][ParallelTick::load] Config loaded, enabled={}, debug={}, stats={}, threadCount={}, maxEntities={}, gridBase={}",
+    
+    // 初始化自动调整值
+    mAutoMaxEntities.store(mConfig.maxEntitiesPerTask);
+    
+    getSelf().getLogger().info("[{}][ParallelTick::load] Config loaded, enabled={}, debug={}, stats={}, threadCount={}, maxEntities={}, gridBase={}, autoAdjust={}, targetMs={}",
                                currentTimeString(), mConfig.enabled, mConfig.debug, mConfig.stats, mConfig.threadCount,
-                               mConfig.maxEntitiesPerTask, mConfig.gridSizeBase);
+                               mConfig.maxEntitiesPerTask, mConfig.gridSizeBase, mConfig.autoAdjust, mConfig.targetTickMs);
     return true;
 }
 
@@ -210,7 +214,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ----------------------------------------------------------------
-// Level::$tick 外层 Hook — 动态分区并行
+// Level::$tick 外层 Hook — 动态分区并行 + 自动调整
 // ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
@@ -220,7 +224,6 @@ LL_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
-    // 线程局部重入保护
     static thread_local bool inTick = false;
     if (inTick) {
         origin();
@@ -230,6 +233,8 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto  conf = pt.getConfig();
+
+    auto tickStart = std::chrono::steady_clock::now();
 
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Enter, enabled={}", currentTimeString(), conf.enabled);
@@ -296,7 +301,9 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ============= 动态分区开始 =============
+    // 使用自动调整后的 maxEntitiesPerTask
+    int currentMax = conf.autoAdjust ? pt.getAutoMaxEntities() : conf.maxEntitiesPerTask;
+
     // 1. 构建网格映射
     std::unordered_map<parallel_tick::GridPos, std::vector<parallel_tick::ActorTickEntry>, parallel_tick::GridPosHash> gridMap;
     for (auto& entry : valid) {
@@ -330,7 +337,7 @@ LL_TYPE_INSTANCE_HOOK(
                 parallel_tick::GridPos neighbor{cur.x + dx, cur.z};
                 auto it = gridMap.find(neighbor);
                 if (it != gridMap.end() && !visited.count(neighbor)) {
-                    if (taskBlock.size() + it->second.size() <= (size_t)conf.maxEntitiesPerTask) {
+                    if (taskBlock.size() + it->second.size() <= (size_t)currentMax) {
                         taskBlock.insert(taskBlock.end(), it->second.begin(), it->second.end());
                         visited.insert(neighbor);
                         q.push(neighbor);
@@ -341,7 +348,7 @@ LL_TYPE_INSTANCE_HOOK(
                 parallel_tick::GridPos neighbor{cur.x, cur.z + dz};
                 auto it = gridMap.find(neighbor);
                 if (it != gridMap.end() && !visited.count(neighbor)) {
-                    if (taskBlock.size() + it->second.size() <= (size_t)conf.maxEntitiesPerTask) {
+                    if (taskBlock.size() + it->second.size() <= (size_t)currentMax) {
                         taskBlock.insert(taskBlock.end(), it->second.begin(), it->second.end());
                         visited.insert(neighbor);
                         q.push(neighbor);
@@ -409,6 +416,29 @@ LL_TYPE_INSTANCE_HOOK(
     pool.waitAll();
 
     pt.clearLive();
+
+    // 测量耗时并自动调整
+    auto tickEnd = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tickEnd - tickStart).count();
+
+    if (conf.autoAdjust && conf.enabled) {
+        int oldVal = pt.getAutoMaxEntities();
+        int newVal = oldVal;
+        if (elapsed > conf.targetTickMs + 5) {
+            newVal = std::max(conf.minEntitiesPerTask, oldVal - conf.adjustStep);
+        } else if (elapsed < conf.targetTickMs - 5) {
+            newVal = std::min(conf.maxEntitiesPerTaskLimit, oldVal + conf.adjustStep);
+        }
+        if (newVal != oldVal) {
+            pt.setAutoMaxEntities(newVal);
+            if (conf.debug) {
+                pt.getSelf().getLogger().info("[{}][AutoAdjust] maxEntities changed: {} -> {} (took {}ms)", currentTimeString(), oldVal, newVal, elapsed);
+            }
+        } else if (conf.debug) {
+            pt.getSelf().getLogger().info("[{}][AutoAdjust] no change (took {}ms)", currentTimeString(), elapsed);
+        }
+    }
+
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Exit", currentTimeString());
     }
