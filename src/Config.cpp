@@ -2,13 +2,11 @@
 #include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
-#include <string>
 #include <filesystem>
 
 namespace parallel_tick {
 
 static Config configInstance;
-static const std::string CONFIG_PATH = "config/parallel_tick.json";
 
 Config& getConfig() {
     return configInstance;
@@ -16,20 +14,22 @@ Config& getConfig() {
 
 bool loadConfig() {
     auto& logger = ll::mod::NativeMod::current()->getLogger();
+    auto configDir = ll::mod::NativeMod::current()->getConfigDir();
+    auto configPath = configDir / "parallel_tick.json";
+
     try {
-        if (!ll::config::loadConfig(configInstance, CONFIG_PATH)) {
+        if (!ll::config::loadConfig(configInstance, configPath)) {
             // 文件不存在，创建默认配置
-            std::filesystem::path configDir = std::filesystem::path(CONFIG_PATH).parent_path();
-            if (!configDir.empty() && !std::filesystem::exists(configDir)) {
+            if (!std::filesystem::exists(configDir)) {
                 std::filesystem::create_directories(configDir);
             }
-            if (!ll::config::saveConfig(configInstance, CONFIG_PATH)) {
-                logger.error("Failed to save default config to {}", CONFIG_PATH);
+            if (!ll::config::saveConfig(configInstance, configPath)) {
+                logger.error("Failed to save default config to {}", configPath.string());
                 return false;
             }
-            logger.info("Created default config at {}", CONFIG_PATH);
+            logger.info("Created default config at {}", configPath.string());
         } else {
-            logger.info("Loaded config from {}", CONFIG_PATH);
+            logger.info("Loaded config from {}", configPath.string());
         }
         // 版本检查
         if (configInstance.version != 2) {
@@ -43,7 +43,8 @@ bool loadConfig() {
 }
 
 bool saveConfig() {
-    return ll::config::saveConfig(configInstance, CONFIG_PATH);
+    auto configPath = ll::mod::NativeMod::current()->getConfigDir() / "parallel_tick.json";
+    return ll::config::saveConfig(configInstance, configPath);
 }
 
 } // namespace parallel_tick
