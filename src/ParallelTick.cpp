@@ -72,7 +72,9 @@ bool ParallelTick::disable() {
 
 } // namespace parallel_tick
 
-// --- 生命周期写锁 Hooks ---
+// ----------------------------------------------------------------
+// 生命周期写锁 Hooks
+// ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelAddEntityLock,
@@ -96,6 +98,7 @@ LL_TYPE_INSTANCE_HOOK(
     ::Actor& actor
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
+    // 先从存活集合移除，再加写锁删除实体
     pt.onActorRemoved(&actor);
     std::unique_lock lock(pt.getLifecycleMutex());
     return origin(actor);
@@ -113,7 +116,9 @@ LL_TYPE_INSTANCE_HOOK(
     return origin(std::move(entityRef));
 }
 
-// --- Actor::tick 拦截 Hook ---
+// ----------------------------------------------------------------
+// Actor::tick 拦截 Hook — 收集阶段把 actor 放入队列
+// ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelActorTickHook,
@@ -138,7 +143,9 @@ LL_TYPE_INSTANCE_HOOK(
     return true;
 }
 
-// --- Level::$tick 外层 Hook ---
+// ----------------------------------------------------------------
+// Level::$tick 外层 Hook — 开关收集窗口 + 并行派发
+// ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelLevelTickHook,
@@ -155,30 +162,38 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
+    // 开启收集窗口，执行原始 tick（Actor::tick hook 在此期间收集实体）
     pt.setCollecting(true);
     origin();
     pt.setCollecting(false);
 
-    auto list = pt.takeQueue(); // takeQueue 同时清空 mLiveActors
+    // 取走队列，mLiveActors 此时仍有效
+    auto list = pt.takeQueue();
 
     if (conf.debug) {
         pt.getSelf().getLogger().info("Queue size: {}", list.size());
     }
 
-    if (list.empty()) return;
+    if (list.empty()) {
+        pt.clearLive();
+        return;
+    }
 
-    // 过滤掉已被删除的 actor（takeQueue 后 mLiveActors 已清空，
-    // 所以这里直接用 isRemoved 标志过滤）
+    // 过滤掉在 origin() 执行期间被删除的 actor
     std::vector<parallel_tick::ActorTickEntry> valid;
     valid.reserve(list.size());
     for (auto& e : list) {
-        if (e.actor && !e.actor->isRemoved()) {
+        if (e.actor && pt.isActorAlive(e.actor)) {
             valid.push_back(e);
         }
     }
 
-    if (valid.empty()) return;
+    if (valid.empty()) {
+        pt.clearLive();
+        return;
+    }
 
+    // 四色棋盘分组，同组内实体空间上不相邻，可安全并行
     struct Groups {
         std::vector<parallel_tick::ActorTickEntry> phase[4];
     } groups;
@@ -204,7 +219,7 @@ LL_TYPE_INSTANCE_HOOK(
         auto& phaseList = groups.phase[p];
         if (phaseList.empty()) continue;
 
-        for (size_t i = 0; i < phaseList.size(); i += conf.batchSize) {
+        for (size_t i = 0; i < phaseList.size(); i += (size_t)conf.batchSize) {
             size_t end        = std::min(i + (size_t)conf.batchSize, phaseList.size());
             auto*  batchBegin = phaseList.data() + i;
             size_t batchCount = end - i;
@@ -213,7 +228,9 @@ LL_TYPE_INSTANCE_HOOK(
                 std::shared_lock lock(pt.getLifecycleMutex());
                 for (size_t j = 0; j < batchCount; ++j) {
                     auto& entry = batchBegin[j];
-                    if (!entry.actor || entry.actor->isRemoved()) continue;
+                    // 执行前再次确认 actor 仍然存活
+                    if (!entry.actor || !pt.isActorAlive(entry.actor)) continue;
+
                     if (conf.debug) {
                         auto typeId   = (int)entry.actor->getEntityTypeId();
                         auto entityId = entry.actor->getRuntimeID().rawID;
@@ -231,11 +248,17 @@ LL_TYPE_INSTANCE_HOOK(
             });
         }
 
+        // 等待本 phase 所有批次完成再进入下一 phase
         pool.waitAll();
     }
+
+    // 全部 phase 执行完毕，清空存活集合
+    pt.clearLive();
 }
 
-// --- 注册/注销 ---
+// ----------------------------------------------------------------
+// 注册 / 注销
+// ----------------------------------------------------------------
 
 void parallel_tick::registerHooks() {
     ParallelAddEntityLock::hook();
