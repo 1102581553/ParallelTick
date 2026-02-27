@@ -15,7 +15,6 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
-#include <optional>
 
 namespace parallel_tick {
 
@@ -125,12 +124,8 @@ struct ParallelTick::Impl {
         std::atomic<size_t> crashedActors{0};
     } stats;
 
-    // 统计输出任务
-    std::atomic<bool>                 statsRunning{false};
-    std::optional<ll::coro::CoroTask<>> statsTask;
-
-    // 最后一次清理的 tick 计数（用于周期性清理）
-    std::atomic<int> lastCleanupTick{0};
+    // 统计输出任务运行标志
+    std::atomic<bool> statsRunning{false};
 };
 
 // ============================================================================
@@ -302,7 +297,7 @@ void ParallelTick::startStatsTask() {
     if (!mImpl || mImpl->statsRunning.load()) return;
     mImpl->statsRunning = true;
 
-    mImpl->statsTask = ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
+    ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
         while (mImpl && mImpl->statsRunning.load()) {
             co_await 100_tick; // 5秒 = 100 tick (50ms/tick)
             if (!mImpl || !mImpl->statsRunning.load()) break;
@@ -315,7 +310,7 @@ void ParallelTick::startStatsTask() {
 void ParallelTick::stopStatsTask() {
     if (mImpl) {
         mImpl->statsRunning = false;
-        mImpl->statsTask.reset(); // 析构协程，自动取消
+        // 协程会在下一次 co_await 时检查标志并退出，无需手动销毁
     }
 }
 
