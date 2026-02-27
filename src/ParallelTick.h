@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ll/api/mod/NativeMod.h>
+#include <ll/api/coro/CoroTask.h>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -16,7 +17,7 @@ namespace parallel_tick {
 // 配置结构（已在 Config.h 定义）
 struct Config;
 
-// 统计结构 - 必须在使用前定义
+// 统计结构
 struct Stats {
     std::atomic<size_t> totalMobsParalleled{0};
     std::atomic<size_t> totalBatches{0};
@@ -67,6 +68,7 @@ public:
     // 统计
     void   addStats(size_t mobs, size_t batches);
     Stats& getStats();
+    void   printStats(); // 输出当前统计信息
 
     // 黑名单定期清理
     void cleanupCrashedList();
@@ -74,6 +76,9 @@ public:
 private:
     ParallelTick()  = default;
     ~ParallelTick() = default;
+
+    void startStatsTask();  // 启动统计输出任务
+    void stopStatsTask();   // 停止统计输出任务
 
     struct Impl;
     std::unique_ptr<Impl> mImpl;
