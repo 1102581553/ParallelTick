@@ -4,7 +4,7 @@
 
 #include "ParallelTick.h"
 
-#include <ll/api/plugin/NativePlugin.h>
+#include <ll/api/mod/NativeMod.h>
 #include <mc/world/actor/Actor.h>
 
 #include <atomic>
