@@ -15,7 +15,6 @@ class ActorUniqueID;
 namespace parallel_tick {
 
 struct Config; // 已在 Config.h 定义
-struct Stats;  // 在 .cpp 内定义
 
 // 线程池接口
 class ThreadPool {
@@ -68,6 +67,10 @@ public:
 private:
     ParallelTick()  = default;
     ~ParallelTick() = default;
+
+    // 配置管理（使用 getSelf()）
+    bool loadConfig();
+    bool saveConfig();
 
     void startStatsTask();  // 启动统计输出任务
     void stopStatsTask();   // 停止统计输出任务
