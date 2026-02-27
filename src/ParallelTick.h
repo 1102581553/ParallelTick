@@ -1,119 +1,90 @@
+// ParallelTick.h
+// 并行 Tick 插件核心单例接口
+// ─────────────────────────────────────────────────────────────────
 #pragma once
-#include <ll/api/mod/NativeMod.h>
-#include <ll/api/io/Logger.h>
-#include <mutex>
-#include <shared_mutex>
-#include <atomic>
-#include <vector>
-#include <unordered_set>
-#include <unordered_map>
-#include <memory>
-#include <array>
-#include "Config.h"
-#include "FixedThreadPool.h"
 
+#include <ll/api/plugin/NativePlugin.h>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+
+// 前向声明
 class Actor;
-class BlockSource;
+class Mob;
 
 namespace parallel_tick {
 
-struct ActorTickEntry { Actor* actor; BlockSource* region; };
-
-struct GridPos {
-    int x, z;
-    bool operator==(const GridPos& o) const { return x == o.x && z == o.z; }
+// ── 配置 ─────────────────────────────────────────────────────────
+struct Config {
+    bool   enabled              = true;
+    bool   debug                = false;
+    int    threadCount          = 0;          // 0 = hardware_concurrency - 1
+    size_t maxEntitiesPerTask   = 64;         // 单个线程池任务最多处理的实体数
+    int    actorTickTimeoutMs   = 5000;       // aiStep 并行阶段超时（ms）
 };
-struct GridPosHash {
-    size_t operator()(const GridPos& p) const {
-        return std::hash<int>()(p.x) * 2654435761u ^ std::hash<int>()(p.z) * 2246822519u;
-    }
+
+// ── 统计 ─────────────────────────────────────────────────────────
+struct Stats {
+    std::atomic<size_t> totalMobsParalleled{0};
+    std::atomic<size_t> totalBatches{0};
+    std::atomic<size_t> crashedActors{0};
 };
-inline int gridColor(const GridPos& gp) {
-    return (((gp.x % 2) + 2) % 2) * 2 + (((gp.z % 2) + 2) % 2);
-}
 
-void registerHooks();
-void unregisterHooks();
-void registerECSHooks();
-void unregisterECSHooks();
-
-class GlobalLocks {
+// ── ThreadPool 接口（实现见 ThreadPool.h / .cpp）─────────────────
+class ThreadPool {
 public:
-    std::mutex entityLifecycleLock;
-    static GlobalLocks& get() { static GlobalLocks s; return s; }
+    explicit ThreadPool(size_t threads);
+    ~ThreadPool();
+
+    void   submit(std::function<void()> task);
+    void   waitAll();
+    bool   waitAllFor(std::chrono::milliseconds timeout);
+    size_t threadCount() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> mImpl;
 };
 
+// ── 主单例 ────────────────────────────────────────────────────────
 class ParallelTick {
 public:
     static ParallelTick& getInstance();
-    ParallelTick() : mSelf(*ll::mod::NativeMod::current()), mPool(nullptr) {}
-    ll::mod::NativeMod& getSelf() const { return mSelf; }
 
-    bool load();
-    bool enable();
-    bool disable();
+    // 插件生命周期
+    bool load(ll::plugin::NativePlugin& self);
+    bool unload();
 
-    const Config&    getConfig() const { return mConfig; }
-    FixedThreadPool& getPool()         { return *mPool; }
+    // 访问器
+    ll::plugin::NativePlugin& getSelf();
+    const Config&             getConfig()  const;
+    ThreadPool&               getPool();
 
-    bool isCollecting() const  { return mCollecting.load(std::memory_order_acquire); }
-    void setCollecting(bool v) { mCollecting.store(v, std::memory_order_release); }
+    // 线程安全检查
+    bool isActorSafeToTick(const Actor* a) const;
 
-    void collectActor(Actor* a, BlockSource& r) {
-        std::lock_guard<std::mutex> lk(mMtx);
-        mQueue.push_back({a, &r}); mLive.insert(a);
-    }
-    std::vector<ActorTickEntry> takeQueue() {
-        std::lock_guard<std::mutex> lk(mMtx);
-        return std::move(mQueue);
-    }
-    void onActorRemoved(Actor* a) {
-        std::lock_guard<std::mutex> lk(mMtx);
-        mLive.erase(a); mCrashed.erase(a);
-    }
-    bool isActorSafeToTick(Actor* a) {
-        std::lock_guard<std::mutex> lk(mMtx);
-        return mLive.count(a) > 0 && mCrashed.count(a) == 0;
-    }
-    void clearAll() {
-        std::lock_guard<std::mutex> lk(mMtx);
-        mLive.clear(); mQueue.clear();
-    }
-    void markCrashed(Actor* a) {
-        std::lock_guard<std::mutex> lk(mMtx);
-        mCrashed.insert(a); mLive.erase(a);
-        mCrashCount.fetch_add(1, std::memory_order_relaxed);
-    }
-    bool isPermanentlyCrashed(Actor* a) {
-        std::lock_guard<std::mutex> lk(mMtx);
-        return mCrashed.count(a) > 0;
-    }
+    // 崩溃黑名单
+    void markCrashed(const Actor* a);
+    bool isCrashed(const Actor* a) const;
 
-    bool isParallelPhase() const  { return mParallel.load(std::memory_order_acquire); }
-    void setParallelPhase(bool v) { mParallel.store(v, std::memory_order_release); }
+    // 并行阶段标志（用于重入保护）
+    void setParallelPhase(bool v);
+    bool isParallelPhase() const;
 
-    void addStats(size_t total, size_t tasks) {
-        mStatTotal.fetch_add(total); mStatTasks.fetch_add(tasks);
-    }
-    std::atomic<size_t>& crashCount() { return mCrashCount; }
+    // 统计
+    void   addStats(size_t mobs, size_t batches);
+    Stats& getStats();
 
 private:
-    void startStatsTask();
-    void stopStatsTask();
+    ParallelTick()  = default;
+    ~ParallelTick() = default;
 
-    ll::mod::NativeMod& mSelf;
-    Config              mConfig;
-    std::unique_ptr<FixedThreadPool> mPool;
-
-    std::mutex                    mMtx;
-    std::atomic<bool>             mCollecting{false};
-    std::vector<ActorTickEntry>   mQueue;
-    std::unordered_set<Actor*>    mLive;
-    std::unordered_set<Actor*>    mCrashed;
-
-    std::atomic<bool>             mParallel{false};
-    std::atomic<size_t>           mStatTotal{0}, mStatTasks{0}, mCrashCount{0};
-    std::atomic<bool>             mStatsRunning{false};
+    struct Impl;
+    std::unique_ptr<Impl> mImpl;
 };
+
+// ── Hook 注册 / 注销（在 ECSHooks.cpp 里实现）────────────────────
+void registerECSHooks();
+void unregisterECSHooks();
 
 } // namespace parallel_tick
