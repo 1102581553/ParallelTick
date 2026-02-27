@@ -116,11 +116,11 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    std::unique_lock<std::shared_mutex> lock(pt.getLifecycleMutex());
+    std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Enter, actor={:p}", currentTimeString(), (void*)&actor);
     }
-    pt.unsafeOnActorRemoved(&actor);
+    pt.onActorRemoved(&actor);
     auto result = origin(actor);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Exit", currentTimeString());
@@ -147,7 +147,7 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    std::unique_lock<std::shared_mutex> lock(pt.getLifecycleMutex());
+    std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Enter", currentTimeString());
     }
@@ -155,7 +155,7 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Found actor={:p}, removing", currentTimeString(), (void*)actor);
         }
-        pt.unsafeOnActorRemoved(actor);
+        pt.onActorRemoved(actor);
     } else {
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Failed to get actor from WeakEntityRef", currentTimeString());
@@ -294,7 +294,7 @@ LL_TYPE_INSTANCE_HOOK(
         int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
         groups.phase[color].push_back(entry);
         if (conf.debug) {
-            pt.getSelf().getLogger().info("[{}][ParallelTick] Grouping: actor={:p}, pos=({:.2f},{:.2f},{:.2f}) -> color={}", 
+            pt.getSelf().getLogger().info("[{}][ParallelTick] Grouping: actor={:p}, pos=({},{},{}) -> color={}", 
                                           currentTimeString(), (void*)entry.actor, pos.x, pos.y, pos.z, color);
         }
     }
@@ -334,7 +334,7 @@ LL_TYPE_INSTANCE_HOOK(
             }
 
             pool.submit([&pt, conf, batchBegin, batchCount, p, i] {
-                std::shared_lock<std::shared_mutex> lock(pt.getLifecycleMutex());
+                std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());  // 独占锁
                 if (conf.debug) {
                     pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Batch started: phase={}, index={}, count={}", 
                                                   currentTimeString(), p, i, batchCount);
