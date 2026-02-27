@@ -116,11 +116,11 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
+    std::unique_lock<std::shared_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Enter, actor={:p}", currentTimeString(), (void*)&actor);
     }
-    pt.onActorRemoved(&actor);
+    pt.unsafeOnActorRemoved(&actor);
     auto result = origin(actor);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Exit", currentTimeString());
@@ -147,7 +147,7 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
+    std::unique_lock<std::shared_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Enter", currentTimeString());
     }
@@ -155,7 +155,7 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Found actor={:p}, removing", currentTimeString(), (void*)actor);
         }
-        pt.onActorRemoved(actor);
+        pt.unsafeOnActorRemoved(actor);
     } else {
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Failed to get actor from WeakEntityRef", currentTimeString());
@@ -294,7 +294,7 @@ LL_TYPE_INSTANCE_HOOK(
         int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
         groups.phase[color].push_back(entry);
         if (conf.debug) {
-            pt.getSelf().getLogger().info("[{}][ParallelTick] Grouping: actor={:p}, pos=({},{},{}) -> color={}", 
+            pt.getSelf().getLogger().info("[{}][ParallelTick] Grouping: actor={:p}, pos=({:.2f},{:.2f},{:.2f}) -> color={}", 
                                           currentTimeString(), (void*)entry.actor, pos.x, pos.y, pos.z, color);
         }
     }
@@ -334,7 +334,7 @@ LL_TYPE_INSTANCE_HOOK(
             }
 
             pool.submit([&pt, conf, batchBegin, batchCount, p, i] {
-                std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
+                std::shared_lock<std::shared_mutex> lock(pt.getLifecycleMutex());
                 if (conf.debug) {
                     pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Batch started: phase={}, index={}, count={}", 
                                                   currentTimeString(), p, i, batchCount);
@@ -381,13 +381,13 @@ LL_TYPE_INSTANCE_HOOK(
                     } catch (const std::exception& e) {
                         pt.getSelf().getLogger().error(
                             "[{}][ParallelTick][Task] Exception during tick: typeId={}, id={}, what={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
-                            currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, (int)dimId  // 强制转换为 int
+                            currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, (int)dimId
                         );
                         // 跳过此实体，继续处理下一个
                     } catch (...) {
                         pt.getSelf().getLogger().error(
                             "[{}][ParallelTick][Task] Unknown exception during tick: typeId={}, id={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
-                            currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, (int)dimId  // 强制转换为 int
+                            currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, (int)dimId
                         );
                         // 跳过此实体，继续处理下一个
                     }
