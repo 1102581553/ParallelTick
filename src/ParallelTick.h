@@ -20,7 +20,6 @@ struct ActorTickEntry {
     BlockSource* region;
 };
 
-// 网格位置哈希
 struct GridPos {
     int x, z;
     bool operator==(const GridPos& other) const { return x == other.x && z == other.z; }
@@ -40,7 +39,8 @@ public:
 
     ParallelTick()
     : mSelf(*ll::mod::NativeMod::current()),
-      mPool(nullptr) {}
+      mPool(nullptr),
+      mAutoMaxEntities(256) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
@@ -52,7 +52,10 @@ public:
     std::recursive_mutex&   getLifecycleMutex() { return mLifecycleMutex; }
     FixedThreadPool&        getPool()           { return *mPool; }
 
-    // 收集实体：写锁
+    // 自动调整参数访问
+    int getAutoMaxEntities() const { return mAutoMaxEntities.load(); }
+    void setAutoMaxEntities(int val) { mAutoMaxEntities.store(val); }
+
     void collectActor(Actor* actor, BlockSource& region) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         mPendingQueue.push_back({actor, &region});
@@ -106,6 +109,9 @@ private:
     std::atomic<size_t>             mParallelStats{0};
     std::atomic<size_t>             mSerialStats{0};
     std::atomic<bool>               mStatsTaskRunning{false};
+
+    // 自动调整参数
+    std::atomic<int>                mAutoMaxEntities;
 };
 
 } // namespace parallel_tick
