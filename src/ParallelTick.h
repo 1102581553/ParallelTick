@@ -81,10 +81,14 @@ public:
     void onActorRemoved(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
         mLiveActors.erase(actor);
+        // 实体被移除时清除崩溃记录（指针即将失效）
+        mCrashedActors.erase(actor);
+        mCrashCount.erase(actor);
     }
 
     bool isActorSafeToTick(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
+        if (mCrashedActors.count(actor) > 0) return false;
         return mLiveActors.count(actor) > 0;
     }
 
@@ -92,6 +96,8 @@ public:
         std::lock_guard<std::mutex> lk(mCollectMutex);
         mLiveActors.clear();
         mPendingQueue.clear();
+        // 注意：mCrashedActors 和 mCrashCount 不清除
+        // 它们在 onActorRemoved 时按实体清除
     }
 
     // ── 并行阶段 ──
@@ -104,42 +110,24 @@ public:
         mParallelPhase.store(v, std::memory_order_release);
     }
 
-    // ── 崩溃追踪（增强版）──
-    void recordCrash(Actor* actor) {
+    // ── 崩溃追踪 ──
+    // 记录一次崩溃，达到阈值后永久跳过
+    // 返回 true = 已达到永久禁用阈值
+    bool recordCrash(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
-        mCrashCount[actor]++;
-        if (mCrashCount[actor] >= mConfig.maxCrashCountPerActor) {
+        int count = ++mCrashCount[actor];
+        mCrashStats.fetch_add(1, std::memory_order_relaxed);
+        if (count >= mConfig.maxCrashCountPerActor) {
             mCrashedActors.insert(actor);
             mLiveActors.erase(actor);
+            return true;
         }
+        return false;
     }
 
     bool isPermanentlyCrashed(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
         return mCrashedActors.count(actor) > 0;
-    }
-
-    // 收集需要在主线程 kill 的崩溃实体
-    void scheduleKill(Actor* actor) {
-        std::lock_guard<std::mutex> lk(mKillMutex);
-        mPendingKills.push_back(actor);
-    }
-
-    std::vector<Actor*> takePendingKills() {
-        std::lock_guard<std::mutex> lk(mKillMutex);
-        return std::move(mPendingKills);
-    }
-
-    void clearCrashData() {
-        std::lock_guard<std::mutex> lk(mCollectMutex);
-        // 只清除计数，永久标记保留到实体被移除
-    }
-
-    // 实体被移除时清除其崩溃记录
-    void clearCrashRecord(Actor* actor) {
-        std::lock_guard<std::mutex> lk(mCollectMutex);
-        mCrashedActors.erase(actor);
-        mCrashCount.erase(actor);
     }
 
     // ── 统计 ──
@@ -158,25 +146,18 @@ private:
     Config                           mConfig;
     std::unique_ptr<FixedThreadPool> mPool;
 
-    // 收集保护
     std::mutex                  mCollectMutex;
     std::atomic<bool>           mCollecting{false};
     std::vector<ActorTickEntry> mPendingQueue;
     std::unordered_set<Actor*>  mLiveActors;
 
-    // 并行阶段
     std::atomic<bool>           mParallelPhase{false};
     std::mutex                  mLevelMutex;
 
-    // 崩溃追踪
-    std::unordered_set<Actor*>           mCrashedActors;
-    std::unordered_map<Actor*, int>      mCrashCount;
+    // 崩溃追踪（持久化到实体被移除）
+    std::unordered_set<Actor*>      mCrashedActors;
+    std::unordered_map<Actor*, int> mCrashCount;
 
-    // 延迟 kill 队列（主线程消费）
-    std::mutex              mKillMutex;
-    std::vector<Actor*>     mPendingKills;
-
-    // 统计
     std::atomic<size_t> mTotalStats{0};
     std::atomic<size_t> mPhaseStats{0};
     std::atomic<size_t> mCrashStats{0};
