@@ -22,17 +22,51 @@
 #include <unordered_map>
 #include <cstdio>
 #include <array>
+#include <exception>
+#include <malloc.h>
 
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext>(Level::*)(::Actor&);
 using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext>(Level::*)(::WeakEntityRef);
 
-// ── SEH 安全 tick（独立非内联函数，无 C++ 析构对象）──
-static int tickActorSafe(Actor* actor, BlockSource& region) {
+// ================================================================
+//  多层防崩溃 tick
+//
+//  第1层: C++ try-catch    — 捕获标准异常
+//  第2层: SEH __try        — 捕获硬件异常(AV/除零等)
+//  第3层: 栈溢出恢复        — EXCEPTION_STACK_OVERFLOW 后 _resetstkoflw
+//
+//  返回值:
+//    0  = 正常
+//    >0 = SEH 异常代码
+//    -1 = C++ std::exception
+//    -2 = 未知 C++ 异常
+// ================================================================
+static int tickActorSEH(Actor* actor, BlockSource& region) {
     __try {
         actor->tick(region);
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return GetExceptionCode();
+        DWORD code = GetExceptionCode();
+        if (code == EXCEPTION_STACK_OVERFLOW) {
+            _resetstkoflw();
+        }
+        return static_cast<int>(code);
+    }
+}
+
+static int tickActorSafe(Actor* actor, BlockSource& region) {
+    try {
+        return tickActorSEH(actor, region);
+    } catch (const std::exception& e) {
+        fprintf(stderr,
+            "[ParallelTick] C++ exception in actor %p: %s\n",
+            (void*)actor, e.what());
+        return -1;
+    } catch (...) {
+        fprintf(stderr,
+            "[ParallelTick] Unknown C++ exception in actor %p\n",
+            (void*)actor);
+        return -2;
     }
 }
 
@@ -72,10 +106,11 @@ void ParallelTick::startStatsTask() {
                 if (!mConfig.stats) return;
                 size_t tot = mTotalStats.exchange(0);
                 size_t ph  = mPhaseStats.exchange(0);
+                size_t cr  = mCrashStats.load();
                 if (tot > 0)
                     getSelf().getLogger().info(
-                        "[{}][Stats] Total={} Phases={}",
-                        currentTimeString(), tot, ph);
+                        "[{}][Stats] Entities={} Tasks={} CrashedTotal={}",
+                        currentTimeString(), tot, ph, cr);
             });
         }
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
@@ -90,10 +125,12 @@ bool ParallelTick::load() {
         ll::config::saveConfig(mConfig, path);
     mAutoMaxEntities.store(mConfig.maxEntitiesPerTask);
     getSelf().getLogger().info(
-        "[{}][load] enabled={} debug={} threads={} maxE={} grid={} auto={} target={}ms",
+        "[{}][load] enabled={} debug={} threads={} maxE={} grid={} "
+        "auto={} target={}ms timeout={}ms killCrashed={}",
         currentTimeString(), mConfig.enabled, mConfig.debug,
         mConfig.threadCount, mConfig.maxEntitiesPerTask,
-        mConfig.gridSizeBase, mConfig.autoAdjust, mConfig.targetTickMs);
+        mConfig.gridSizeBase, mConfig.autoAdjust, mConfig.targetTickMs,
+        mConfig.actorTickTimeoutMs, mConfig.killCrashedActors);
     return true;
 }
 
@@ -122,7 +159,6 @@ bool ParallelTick::disable() {
 // ================================================================
 
 // ── removeEntity（两个重载）──
-// 并行阶段通过 LevelMutex 串行化 origin 调用
 LL_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
     ll::memory::HookPriority::Normal,
@@ -133,6 +169,7 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = ParallelTick::getInstance();
     pt.onActorRemoved(&actor);
+    pt.clearCrashRecord(&actor);
 
     if (pt.isParallelPhase()) {
         std::lock_guard<std::mutex> lk(pt.getLevelMutex());
@@ -150,8 +187,10 @@ LL_TYPE_INSTANCE_HOOK(
     ::WeakEntityRef entityRef
 ) {
     auto& pt = ParallelTick::getInstance();
-    if (Actor* a = tryGetActorFromWeakRef(entityRef))
+    if (Actor* a = tryGetActorFromWeakRef(entityRef)) {
         pt.onActorRemoved(a);
+        pt.clearCrashRecord(a);
+    }
 
     if (pt.isParallelPhase()) {
         std::lock_guard<std::mutex> lk(pt.getLevelMutex());
@@ -161,7 +200,6 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ── Actor::tick Hook ──
-// 收集阶段：拦截非玩家实体入队，不执行 origin
 LL_TYPE_INSTANCE_HOOK(
     ParallelActorTickHook,
     ll::memory::HookPriority::Normal,
@@ -170,18 +208,16 @@ LL_TYPE_INSTANCE_HOOK(
     bool,
     ::BlockSource& region
 ) {
-    auto& pt        = ParallelTick::getInstance();
+    auto& pt         = ParallelTick::getInstance();
     const auto& conf = pt.getConfig();
 
     if (!conf.enabled || !pt.isCollecting())
         return origin(region);
 
-    // 玩家/模拟玩家始终串行
     if (this->isPlayer() || this->isSimulatedPlayer())
         return origin(region);
 
-    // 已崩溃实体永久跳过
-    if (pt.isCrashed(this))
+    if (pt.isPermanentlyCrashed(this))
         return true;
 
     pt.collectActor(this, region);
@@ -200,16 +236,14 @@ LL_TYPE_INSTANCE_HOOK(
 // 核心设计：4-色棋盘分相并行
 //
 //   网格坐标 (gx, gz) 着色: color = (gx%2)*2 + (gz%2)，共 4 色
-//   同色网格在 X 和 Z 方向上间距 ≥ 2 个网格 = 2 * gridSizeBase
-//   gridSizeBase=64 时，同色网格间距 ≥ 128 格，远超任何实体交互半径
+//   同色网格在 X/Z 方向间距 ≥ 2*gridSizeBase
+//   gridSizeBase=64 → 同色间距 ≥ 128 格，远超任何交互范围
 //
-//   执行顺序：
-//     Phase 0 → waitAll → Phase 1 → waitAll → Phase 2 → waitAll → Phase 3 → waitAll
+//   Phase 0 → waitAll → Phase 1 → waitAll → Phase 2 → waitAll → Phase 3 → waitAll
 //
-//   同一 Phase 内的所有任务可安全并行：
-//     - 不会访问相同的区块（空间距离 ≥ 128 格）
-//     - 不会互相交互（超出最大交互距离）
-//     - Level 全局变更（addEntity/removeEntity）通过 LevelMutex 串行化
+//   同 Phase 内安全并行：
+//     - 不访问相同区块（空间距离 ≥ 128 格）
+//     - Level 全局变更通过 LevelMutex 串行
 //
 LL_TYPE_INSTANCE_HOOK(
     ParallelLevelTickHook,
@@ -234,10 +268,30 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     // ════════════════════════════════════════════════════════
+    //  阶段 0：主线程处理上一 tick 积累的延迟 kill
+    //  必须在 origin() 之前、非并行阶段执行
+    // ════════════════════════════════════════════════════════
+    if (conf.killCrashedActors) {
+        auto kills = pt.takePendingKills();
+        for (Actor* a : kills) {
+            try {
+                if (a && a->isInWorld()) {
+                    pt.getSelf().getLogger().warn(
+                        "[{}][Kill] Removing crashed actor={:p} type={}",
+                        currentTimeString(), (void*)a,
+                        static_cast<int>(a->getEntityTypeId()));
+                    a->remove();
+                }
+            } catch (...) {
+                pt.getSelf().getLogger().error(
+                    "[Kill] Failed to remove actor={:p}", (void*)a);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
     //  阶段 1：收集实体
-    //  origin() 内部遍历实体 → Actor::tick Hook 拦截入队
-    //  origin() 完成后，MCBE 的非实体逻辑（红石/区块/天气等）已执行
-    //  所有非玩家实体的 tick 被拦截，未实际执行
+    //  origin() 执行 MCBE 所有逻辑，Actor::tick Hook 拦截入队
     // ════════════════════════════════════════════════════════
     pt.setCollecting(true);
     origin();
@@ -259,7 +313,7 @@ LL_TYPE_INSTANCE_HOOK(
     for (auto& e : list) {
         if (!e.actor) continue;
         if (!pt.isActorSafeToTick(e.actor)) continue;
-        if (pt.isCrashed(e.actor)) continue;
+        if (pt.isPermanentlyCrashed(e.actor)) continue;
         snapshot.push_back(e);
     }
 
@@ -277,16 +331,12 @@ LL_TYPE_INSTANCE_HOOK(
     // ════════════════════════════════════════════════════════
     //  阶段 3：按 BlockSource 分组 → 网格分区 → 4-色着色
     // ════════════════════════════════════════════════════════
-
-    // 结构：phases[color] = vector<Task>
-    // Task = { BlockSource*, vector<ActorTickEntry> }
     struct Task {
-        BlockSource*              bs;
+        BlockSource*                bs;
         std::vector<ActorTickEntry> entries;
     };
     std::array<std::vector<Task>, 4> phases;
 
-    // 按 BlockSource 分组
     std::unordered_map<BlockSource*, std::vector<ActorTickEntry>> bsMap;
     for (auto& e : snapshot)
         bsMap[e.region].push_back(e);
@@ -298,7 +348,6 @@ LL_TYPE_INSTANCE_HOOK(
     size_t totalTasks = 0;
 
     for (auto& [bs, entries] : bsMap) {
-        // 按网格坐标分桶
         std::unordered_map<GridPos, std::vector<ActorTickEntry>, GridPosHash> gridMap;
         for (auto& e : entries) {
             auto pos = e.actor->getPosition();
@@ -309,8 +358,6 @@ LL_TYPE_INSTANCE_HOOK(
             gridMap[gp].push_back(e);
         }
 
-        // 每个网格按 color 分入对应 phase
-        // 同一 color 内，如果单个网格实体数 > curMax，拆分成多个 Task
         for (auto& [gp, ge] : gridMap) {
             int color = gridColor(gp);
 
@@ -319,7 +366,7 @@ LL_TYPE_INSTANCE_HOOK(
                 totalTasks++;
             } else {
                 // 拆分大网格
-                for (size_t i = 0; i < ge.size(); i += curMax) {
+                for (size_t i = 0; i < ge.size(); i += static_cast<size_t>(curMax)) {
                     size_t end = std::min(i + static_cast<size_t>(curMax), ge.size());
                     std::vector<ActorTickEntry> chunk(ge.begin() + i, ge.begin() + end);
                     phases[color].push_back({bs, std::move(chunk)});
@@ -341,17 +388,11 @@ LL_TYPE_INSTANCE_HOOK(
 
     // ════════════════════════════════════════════════════════
     //  阶段 4：逐相位并行执行
-    //
-    //  同一相位内的所有网格间距 ≥ 2*gridSizeBase（128格）
-    //  → 不可能访问相同区块
-    //  → 不可能互相交互（远超最大交互距离）
-    //
-    //  相位之间有 barrier（waitAll），确保串行
-    //
-    //  Level 全局变更（removeEntity 等）通过 LevelMutex 串行化
     // ════════════════════════════════════════════════════════
     pt.setParallelPhase(true);
     auto& pool = pt.getPool();
+    auto  phaseTimeoutMs = std::chrono::milliseconds(
+        conf.actorTickTimeoutMs > 0 ? conf.actorTickTimeoutMs : 30000);
 
     for (int color = 0; color < 4; ++color) {
         auto& phaseTasks = phases[color];
@@ -367,10 +408,8 @@ LL_TYPE_INSTANCE_HOOK(
                          entries = std::move(task.entries)]() mutable
             {
                 for (auto& e : entries) {
-                    // 在锁内做最终存活检查，消除 TOCTOU
+                    // 锁内最终检查，消除 TOCTOU
                     if (!pt.isActorSafeToTick(e.actor)) continue;
-
-                    // 二次检查 isInWorld
                     if (!e.actor->isInWorld()) continue;
 
                     if (conf.debug)
@@ -380,34 +419,78 @@ LL_TYPE_INSTANCE_HOOK(
                             static_cast<int>(e.actor->getEntityTypeId()),
                             e.actor->getRuntimeID().rawID);
 
+                    auto start = std::chrono::steady_clock::now();
                     int ex = tickActorSafe(e.actor, *bs);
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start).count();
 
                     if (ex != 0) {
-                        // SEH 异常：标记该实体永久跳过
-                        // 状态可能已损坏，不能继续 tick 此实体
-                        pt.markCrashed(e.actor);
+                        // ── 异常处理 ──
+                        pt.recordCrash(e.actor);
+                        pt.getCrashStats().fetch_add(1, std::memory_order_relaxed);
+
+                        const char* exType = (ex == -1) ? "C++exception"
+                                           : (ex == -2) ? "UnknownC++exception"
+                                           : "SEH";
+
                         fprintf(stderr,
-                            "[ParallelTick] SEH 0x%08X actor=%p type=%d — "
-                            "permanently disabled\n",
-                            static_cast<unsigned>(ex),
+                            "[ParallelTick] %s 0x%08X actor=%p type=%d "
+                            "— crash recorded\n",
+                            exType, static_cast<unsigned>(ex),
                             (void*)e.actor,
                             static_cast<int>(e.actor->getEntityTypeId()));
-                        if (conf.debug)
+
+                        pt.getSelf().getLogger().error(
+                            "[{}][Crash] {} 0x{:08X} actor={:p} type={} "
+                            "elapsed={}ms — marked",
+                            currentTimeString(), exType,
+                            static_cast<unsigned>(ex), (void*)e.actor,
+                            static_cast<int>(e.actor->getEntityTypeId()), ms);
+
+                        // 如果已达永久阈值且配置了 kill，加入延迟 kill 队列
+                        if (conf.killCrashedActors
+                            && pt.isPermanentlyCrashed(e.actor))
+                        {
+                            pt.scheduleKill(e.actor);
                             pt.getSelf().getLogger().warn(
-                                "[Tick] SEH 0x{:08X} actor={:p} — marked crashed",
-                                static_cast<unsigned>(ex), (void*)e.actor);
-                    } else if (conf.debug) {
-                        pt.getSelf().getLogger().info(
-                            "[{}][Tick] Done actor={:p}",
-                            currentTimeString(), (void*)e.actor);
+                                "[{}][Crash] actor={:p} scheduled for kill",
+                                currentTimeString(), (void*)e.actor);
+                        }
+
+                        // 跳过同 task 后续实体？不跳——其他实体可能无关
+                        // 但当前实体状态可能已脏，不再继续它就够了
+                        continue;
                     }
+
+                    // ── 慢 tick 警告 ──
+                    if (ms > 100) {
+                        pt.getSelf().getLogger().warn(
+                            "[{}][SlowTick] actor={:p} type={} took {}ms",
+                            currentTimeString(), (void*)e.actor,
+                            static_cast<int>(e.actor->getEntityTypeId()), ms);
+                    }
+
+                    if (conf.debug)
+                        pt.getSelf().getLogger().info(
+                            "[{}][Tick] Done actor={:p} {}ms",
+                            currentTimeString(), (void*)e.actor, ms);
                 }
             });
         }
 
-        // ── Phase Barrier ──
-        // 等待当前相位所有任务完成后，才开始下一相位
-        pool.waitAll();
+        // ── Phase Barrier（带超时）──
+        bool ok = pool.waitAllFor(phaseTimeoutMs);
+        if (!ok) {
+            // 超时：某些 task 卡死
+            pt.getSelf().getLogger().error(
+                "[{}][Phase {}] TIMEOUT after {}ms! pending={} — "
+                "continuing to avoid server hang",
+                currentTimeString(), color, phaseTimeoutMs.count(),
+                pool.pendingCount());
+            // 不能 abort 线程，只能继续（线程最终会完成或被 SEH 捕获）
+            // 等待更长时间再继续
+            pool.waitAllFor(std::chrono::milliseconds(phaseTimeoutMs.count() * 2));
+        }
 
         if (conf.debug)
             pt.getSelf().getLogger().info(
@@ -440,7 +523,7 @@ LL_TYPE_INSTANCE_HOOK(
             pt.setAutoMaxEntities(newVal);
             if (conf.debug)
                 pt.getSelf().getLogger().info(
-                    "[{}][AutoAdjust] {} → {} ({}ms)",
+                    "[{}][AutoAdjust] {} -> {} ({}ms)",
                     currentTimeString(), oldVal, newVal, elapsed);
         }
     }
