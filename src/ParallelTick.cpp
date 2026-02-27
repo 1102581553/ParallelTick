@@ -42,8 +42,6 @@ struct ThreadPool::Impl {
 };
 
 ThreadPool::ThreadPool(size_t threads) : mImpl(std::make_unique<Impl>()) {
-    // 注意：这里不能使用 NativeMod::current()，因为线程可能在插件卸载后运行
-    // 改为在任务中通过 ParallelTick 实例获取 logger
     for (size_t i = 0; i < threads; ++i) {
         mImpl->workers.emplace_back([this] {
             while (true) {
@@ -58,7 +56,6 @@ ThreadPool::ThreadPool(size_t threads) : mImpl(std::make_unique<Impl>()) {
                     mImpl->tasks.pop();
                 }
 
-                // 任务内不再捕获异常，由提交者负责（已在提交时包裹 try-catch）
                 task();
 
                 if (--mImpl->activeTasks == 0) {
@@ -210,7 +207,8 @@ bool ParallelTick::isActorSafeToTick(Actor* a) const {
 
 void ParallelTick::markCrashed(Actor* a) {
     if (!a) return;
-    ActorUniqueID id = a->getUniqueID(); // 假设存在，若不存在需改为正确函数
+    // 使用 getOrCreateUniqueID 获取 ActorUniqueID
+    ActorUniqueID id = a->getOrCreateUniqueID();
     {
         std::lock_guard lk(mImpl->crashMtx);
         mImpl->crashedActors[id] = { std::chrono::steady_clock::now() };
@@ -223,7 +221,7 @@ void ParallelTick::markCrashed(Actor* a) {
 
 bool ParallelTick::isCrashed(Actor* a) const {
     if (!a) return false;
-    ActorUniqueID id = a->getUniqueID();
+    ActorUniqueID id = a->getOrCreateUniqueID();
     std::lock_guard lk(mImpl->crashMtx);
     return mImpl->crashedActors.find(id) != mImpl->crashedActors.end();
 }
