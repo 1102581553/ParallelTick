@@ -6,7 +6,18 @@
 #include <condition_variable>
 #include <atomic>
 #include <vector>
-#include <string>
+#include <cstdio>
+
+// SEH 包装：必须是独立的非内联函数，内部不能有任何 C++ 析构对象
+// 返回 0 表示正常，非 0 为 SEH 异常码
+static int invokeWithSEH(std::function<void()>& f) {
+    __try {
+        f();
+        return 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+}
 
 class FixedThreadPool {
 public:
@@ -14,10 +25,7 @@ public:
         : mStop(false), mPending(0)
     {
         for (size_t i = 0; i < n; ++i) {
-            // 使用 CreateThread 指定栈大小（默认8MB）
-            struct Param {
-                FixedThreadPool* pool;
-            };
+            struct Param { FixedThreadPool* pool; };
             auto* param = new Param{this};
             HANDLE h = CreateThread(
                 nullptr,
@@ -28,15 +36,10 @@ public:
                     delete param;
                     return 0;
                 },
-                param,
-                0,
-                nullptr
+                param, 0, nullptr
             );
-            if (h) {
-                mWorkers.push_back(h);
-            } else {
-                delete param;
-            }
+            if (h) mWorkers.push_back(h);
+            else   delete param;
         }
     }
 
@@ -56,22 +59,7 @@ public:
         ++mPending;
         {
             std::lock_guard<std::mutex> lock(mMutex);
-            mTasks.push([this, f = std::move(f)]() mutable {
-                // 异常不重抛，只记录日志，保证工作线程不崩溃
-                try {
-                    f();
-                } catch (const std::exception& e) {
-                    // 记录到 stderr，不重抛
-                    fprintf(stderr, "[FixedThreadPool] Task exception: %s\n", e.what());
-                } catch (...) {
-                    fprintf(stderr, "[FixedThreadPool] Task unknown exception\n");
-                }
-                // RAII 保证无论是否异常都递减
-                if (--mPending == 0) {
-                    std::lock_guard<std::mutex> lock(mDoneMutex);
-                    mDoneCv.notify_all();
-                }
-            });
+            mTasks.push(std::move(f));
         }
         mCv.notify_one();
     }
@@ -92,7 +80,20 @@ private:
                 task = std::move(mTasks.front());
                 mTasks.pop();
             }
-            task();
+
+            // SEH 捕获硬件异常（0xC0000005 等），工作线程不崩溃
+            int exCode = invokeWithSEH(task);
+            if (exCode != 0) {
+                fprintf(stderr,
+                    "[FixedThreadPool] SEH exception 0x%08X in task\n",
+                    static_cast<unsigned>(exCode));
+            }
+
+            // 无论成功或异常都递减，防止 waitAll 永久阻塞
+            if (--mPending == 0) {
+                std::lock_guard<std::mutex> lock(mDoneMutex);
+                mDoneCv.notify_all();
+            }
         }
     }
 
