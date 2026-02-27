@@ -24,7 +24,7 @@ using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntity
 
 namespace parallel_tick {
 
-// 辅助函数：获取当前时间字符串（线程安全版本）
+// 辅助函数：获取当前时间字符串（线程安全）
 static std::string currentTimeString() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
@@ -93,27 +93,7 @@ bool ParallelTick::disable() {
 // 生命周期写锁 Hooks
 // ----------------------------------------------------------------
 
-LL_TYPE_INSTANCE_HOOK(
-    ParallelAddEntityLock,
-    ll::memory::HookPriority::Normal,
-    Level,
-    &Level::$addEntity,
-    ::Actor*,
-    ::BlockSource& region,
-    ::OwnerPtr<::EntityContext> entity
-) {
-    auto& pt = parallel_tick::ParallelTick::getInstance();
-    auto& conf = pt.getConfig();
-    if (conf.debug) {
-        pt.getSelf().getLogger().info("[{}][ParallelAddEntityLock] Enter, acquiring write lock", currentTimeString());
-    }
-    std::unique_lock lock(pt.getLifecycleMutex());
-    auto result = origin(region, std::move(entity));
-    if (conf.debug) {
-        pt.getSelf().getLogger().info("[{}][ParallelAddEntityLock] Exit, lock released", currentTimeString());
-    }
-    return result;
-}
+// 注意：ParallelAddEntityLock 已被移除，因为它不需要保护我们的数据结构，且可能导致递归锁问题。
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
@@ -125,13 +105,12 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    // 先获取写锁
-    std::unique_lock lock(pt.getLifecycleMutex());
+    // 先获取递归互斥量（允许同一线程重复加锁）
+    std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Enter, actor={:p}", currentTimeString(), (void*)&actor);
     }
-    // 直接从存活集合中移除（不加锁版本）
-    pt.unsafeOnActorRemoved(&actor);
+    pt.onActorRemoved(&actor);   // 内部会加锁，但递归锁允许
     auto result = origin(actor);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Exit", currentTimeString());
@@ -158,8 +137,7 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    // 先获取写锁
-    std::unique_lock lock(pt.getLifecycleMutex());
+    std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Enter", currentTimeString());
     }
@@ -167,7 +145,7 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Found actor={:p}, removing", currentTimeString(), (void*)actor);
         }
-        pt.unsafeOnActorRemoved(actor);
+        pt.onActorRemoved(actor);
     } else {
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Failed to get actor from WeakEntityRef", currentTimeString());
@@ -350,7 +328,8 @@ LL_TYPE_INSTANCE_HOOK(
             }
 
             pool.submit([&pt, conf, batchBegin, batchCount, p, i] {
-                std::shared_lock lock(pt.getLifecycleMutex());
+                // 由于递归互斥量不支持共享锁，这里也使用独占锁
+                std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
                 if (conf.debug) {
                     pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Batch started: phase={}, index={}, count={}", 
                                                   currentTimeString(), p, i, batchCount);
@@ -372,7 +351,6 @@ LL_TYPE_INSTANCE_HOOK(
                     }
                     if (!alive) continue;
 
-                    // 动态获取当前有效的 BlockSource
                     BlockSource& region = entry.actor->getDimension().getBlockSourceFromMainChunkSource();
 
                     auto typeId   = (int)entry.actor->getEntityTypeId();
@@ -433,7 +411,7 @@ LL_TYPE_INSTANCE_HOOK(
 // ----------------------------------------------------------------
 
 void parallel_tick::registerHooks() {
-    ParallelAddEntityLock::hook();
+    // ParallelAddEntityLock 已移除
     ParallelRemoveActorLock::hook();
     ParallelRemoveWeakRefLock::hook();
     ParallelActorTickHook::hook();
@@ -441,7 +419,7 @@ void parallel_tick::registerHooks() {
 }
 
 void parallel_tick::unregisterHooks() {
-    ParallelAddEntityLock::unhook();
+    // ParallelAddEntityLock 已移除
     ParallelRemoveActorLock::unhook();
     ParallelRemoveWeakRefLock::unhook();
     ParallelActorTickHook::unhook();
