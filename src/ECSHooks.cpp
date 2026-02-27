@@ -12,7 +12,6 @@
 
 namespace parallel_tick {
 
-// ── SEH 保护（两层：SEH 不能与 C++ 异常在同一函数体混用）──────────
 static LONG goalSehFilter(unsigned int code) {
     return (code == 0xE06D7363u) ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
 }
@@ -30,7 +29,6 @@ static int tickGoalSafe(ActorOwnerComponent& aoc) {
     catch (...) { fprintf(stderr, "[GoalSel] Unk\n"); return -2; }
 }
 
-// ── Hook GoalSelectorSystem::tick ────────────────────────────────
 LL_TYPE_INSTANCE_HOOK(
     HookGoalSelectorTick,
     ll::memory::HookPriority::Normal,
@@ -44,15 +42,14 @@ LL_TYPE_INSTANCE_HOOK(
 
     if (!cfg.enabled) { origin(registry); return; }
 
-    // ── 1. 主线程收集所有需要并行的实体 ──────────────────────────
+    // ── 1. 主线程收集 ─────────────────────────────────────────────
     struct Entry { ActorOwnerComponent* comp; Actor* actor; };
     std::vector<Entry> entries;
     entries.reserve(2048);
 
     registry.view<ActorOwnerComponent>().each([&](ActorOwnerComponent& aoc) {
-        // TypedStorage<unique_ptr<Actor>>：根据实际访问方式二选一：
-        //   Actor* actor = aoc.mActor.get();        // 若 TypedStorage 透明转发
-        //   Actor* actor = aoc.mActor.get().get();  // 若需要两次 get()
+        // TypedStorage<8,8,unique_ptr<Actor>> 直接就是 unique_ptr<Actor>
+        // 所以 mActor 就是 unique_ptr<Actor>，直接 .get() 拿裸指针
         Actor* actor = aoc.mActor.get();
         if (!actor)                       return;
         if (actor->isPlayer())            return;
@@ -61,20 +58,19 @@ LL_TYPE_INSTANCE_HOOK(
         entries.push_back({&aoc, actor});
     });
 
-    if (entries.empty()) return; // 无可并行实体，直接跳过（不调 origin，避免重复执行）
+    if (entries.empty()) return;
 
-    // ── 2. 均匀分批：目标批数 = 线程数 × 3，保证负载均衡 ─────────
+    // ── 2. 均匀分批 ───────────────────────────────────────────────
     auto& pool            = pt.getPool();
     const size_t total    = entries.size();
     const size_t nThreads = pool.threadCount();
-    const size_t targetBatches = nThreads * 3;
     const size_t batchSize = std::clamp(
-        (total + targetBatches - 1) / targetBatches,
+        (total + nThreads * 3 - 1) / (nThreads * 3),
         (size_t)1,
         (size_t)cfg.maxEntitiesPerTask
     );
 
-    // ── 3. 全部提交，一次性等待 ───────────────────────────────────
+    // ── 3. 提交并等待 ─────────────────────────────────────────────
     pt.setParallelPhase(true);
 
     const auto timeout = std::chrono::milliseconds(
@@ -84,7 +80,6 @@ LL_TYPE_INSTANCE_HOOK(
     size_t batchCount = 0;
     for (size_t i = 0; i < total; i += batchSize) {
         const size_t end = std::min(i + batchSize, total);
-        // 传下标范围，避免拷贝 entries；entries 在 waitAllFor 返回前不会析构
         pool.submit([begin = i, end, &entries, &pt]() {
             for (size_t j = begin; j < end; ++j) {
                 auto& e = entries[j];
