@@ -70,8 +70,6 @@ bool ParallelTick::disable() {
     return true;
 }
 
-} // namespace parallel_tick
-
 // ----------------------------------------------------------------
 // 生命周期写锁 Hooks
 // ----------------------------------------------------------------
@@ -98,10 +96,24 @@ LL_TYPE_INSTANCE_HOOK(
     ::Actor& actor
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
-    // 先从存活集合移除，再加写锁删除实体
+    // 先从存活集合移除（写锁保护）
     pt.onActorRemoved(&actor);
+    // 再写锁保护原始移除操作
     std::unique_lock lock(pt.getLifecycleMutex());
     return origin(actor);
+}
+
+// 辅助函数：从 WeakEntityRef 获取 Actor 指针
+// 利用 WeakEntityRef::lock() 返回 StackRefResult<EntityContext>
+static Actor* tryGetActorFromWeakRef(WeakEntityRef const& ref) {
+    if (auto stackRef = ref.lock()) {
+        // StackRefResult 提供 operator->() 返回 EntityContext*
+        if (EntityContext* ctx = stackRef.operator->()) {
+            // Actor::tryGetFromEntity 第二个参数 false 表示不包含已移除的实体
+            return Actor::tryGetFromEntity(*ctx, false);
+        }
+    }
+    return nullptr;
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -112,7 +124,13 @@ LL_TYPE_INSTANCE_HOOK(
     ::OwnerPtr<::EntityContext>,
     ::WeakEntityRef entityRef
 ) {
-    std::unique_lock lock(parallel_tick::ParallelTick::getInstance().getLifecycleMutex());
+    auto& pt = parallel_tick::ParallelTick::getInstance();
+    // 尝试获取 Actor 指针并清理 mLiveActors
+    if (Actor* actor = tryGetActorFromWeakRef(entityRef)) {
+        pt.onActorRemoved(actor);
+    }
+    // 写锁保护原始移除操作
+    std::unique_lock lock(pt.getLifecycleMutex());
     return origin(std::move(entityRef));
 }
 
@@ -139,7 +157,7 @@ LL_TYPE_INSTANCE_HOOK(
         return origin(region);
     }
 
-    pt.collectActor(this, region);
+    pt.collectActor(this, region);  // 内部写锁
     return true;
 }
 
@@ -167,7 +185,7 @@ LL_TYPE_INSTANCE_HOOK(
     origin();
     pt.setCollecting(false);
 
-    // 取走队列，mLiveActors 此时仍有效
+    // 取走队列（写锁），mLiveActors 此时仍有效
     auto list = pt.takeQueue();
 
     if (conf.debug) {
@@ -175,15 +193,15 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     if (list.empty()) {
-        pt.clearLive();
+        pt.clearLive();  // 写锁清空
         return;
     }
 
-    // 过滤掉在 origin() 执行期间被删除的 actor
+    // 过滤掉在 origin() 执行期间被删除的 actor（使用读锁检查）
     std::vector<parallel_tick::ActorTickEntry> valid;
     valid.reserve(list.size());
     for (auto& e : list) {
-        if (e.actor && pt.isActorAlive(e.actor)) {
+        if (e.actor && pt.isActorAlive(e.actor)) {  // isActorAlive 内部读锁
             valid.push_back(e);
         }
     }
@@ -225,10 +243,11 @@ LL_TYPE_INSTANCE_HOOK(
             size_t batchCount = end - i;
 
             pool.submit([&pt, conf, batchBegin, batchCount] {
+                // 在任务开始时获取读锁，确保在 tick 期间实体不会被移除
                 std::shared_lock lock(pt.getLifecycleMutex());
                 for (size_t j = 0; j < batchCount; ++j) {
                     auto& entry = batchBegin[j];
-                    // 执行前再次确认 actor 仍然存活
+                    // 执行前再次确认 actor 仍然存活（此时已在读锁内）
                     if (!entry.actor || !pt.isActorAlive(entry.actor)) continue;
 
                     if (conf.debug) {
@@ -277,3 +296,5 @@ void parallel_tick::unregisterHooks() {
 }
 
 LL_REGISTER_MOD(parallel_tick::ParallelTick, parallel_tick::ParallelTick::getInstance());
+
+} // namespace parallel_tick
