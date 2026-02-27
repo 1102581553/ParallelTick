@@ -19,10 +19,7 @@ struct Config {
     int   adjustStep             = 10;
 
     // ── 崩溃保护 ──
-    // 单个实体 tick 超时（毫秒），超时则标记崩溃
-    int   actorTickTimeoutMs     = 5000;
-    // 单个实体连续 SEH/异常次数超过此值则永久禁用
+    int   actorTickTimeoutMs     = 30000;
     int   maxCrashCountPerActor  = 1;
-    // 是否尝试 kill 崩溃实体
-    bool  killCrashedActors      = true;
+    // 不再有 killCrashedActors — 崩溃实体只做永久跳过，不调用 remove()
 };
