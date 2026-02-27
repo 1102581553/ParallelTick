@@ -1,7 +1,7 @@
 #pragma once
 #include <ll/api/mod/NativeMod.h>
 #include <ll/api/io/Logger.h>
-#include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include <vector>
 #include <unordered_set>
@@ -36,33 +36,41 @@ public:
     bool enable();
     bool disable();
 
-    Config&            getConfig()         { return mConfig; }
-    std::recursive_mutex& getLifecycleMutex() { return mLifecycleMutex; }
-    FixedThreadPool&   getPool()           { return *mPool; }
+    Config&                 getConfig()         { return mConfig; }
+    std::shared_mutex&      getLifecycleMutex() { return mLifecycleMutex; }
+    FixedThreadPool&        getPool()           { return *mPool; }
 
+    // 收集实体：写锁
     void collectActor(Actor* actor, BlockSource& region) {
-        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        std::unique_lock<std::shared_mutex> lock(mLifecycleMutex);
         mPendingQueue.push_back({actor, &region});
         mLiveActors.insert(actor);
     }
 
+    // 移除实体（写锁，内部加锁）
     void onActorRemoved(Actor* actor) {
-        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        std::unique_lock<std::shared_mutex> lock(mLifecycleMutex);
         mLiveActors.erase(actor);
     }
 
+    // 不加锁版本，供已持有写锁的调用者使用
+    void unsafeOnActorRemoved(Actor* actor) {
+        mLiveActors.erase(actor);
+    }
+
+    // 检查存活：读锁
     bool isActorAlive(Actor* actor) {
-        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        std::shared_lock<std::shared_mutex> lock(mLifecycleMutex);
         return mLiveActors.count(actor) > 0;
     }
 
     void clearLive() {
-        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        std::unique_lock<std::shared_mutex> lock(mLifecycleMutex);
         mLiveActors.clear();
     }
 
     std::vector<ActorTickEntry> takeQueue() {
-        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        std::unique_lock<std::shared_mutex> lock(mLifecycleMutex);
         return std::move(mPendingQueue);
     }
 
@@ -81,7 +89,7 @@ private:
 
     ll::mod::NativeMod&             mSelf;
     Config                          mConfig;
-    std::recursive_mutex            mLifecycleMutex;
+    std::shared_mutex               mLifecycleMutex;
     std::unique_ptr<FixedThreadPool> mPool;
 
     std::atomic<bool>               mCollecting{false};
