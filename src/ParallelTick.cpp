@@ -6,12 +6,9 @@
 #include <ll/api/mod/RegisterHelper.h>
 
 #include <mc/world/level/Level.h>
-#include <mc/server/ServerLevel.h>
 #include <mc/world/actor/Actor.h>
-#include <mc/world/actor/ActorType.h>
 #include <mc/world/level/BlockSource.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
-#include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
 #include <mc/legacy/ActorRuntimeID.h>
 
@@ -75,7 +72,7 @@ bool ParallelTick::disable() {
 
 // --- 生命周期写锁 Hooks ---
 
-LL_AUTO_TYPE_INSTANCE_HOOK(
+LL_TYPE_INSTANCE_HOOK(
     ParallelAddEntityLock,
     ll::memory::HookPriority::Normal,
     Level,
@@ -88,7 +85,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(region, std::move(entity));
 }
 
-LL_AUTO_TYPE_INSTANCE_HOOK(
+LL_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
     ll::memory::HookPriority::Normal,
     Level,
@@ -100,7 +97,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(actor);
 }
 
-LL_AUTO_TYPE_INSTANCE_HOOK(
+LL_TYPE_INSTANCE_HOOK(
     ParallelRemoveWeakRefLock,
     ll::memory::HookPriority::Normal,
     Level,
@@ -114,7 +111,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
 // --- Actor::tick 拦截 Hook ---
 
-LL_AUTO_TYPE_INSTANCE_HOOK(
+LL_TYPE_INSTANCE_HOOK(
     ParallelActorTickHook,
     ll::memory::HookPriority::Normal,
     Actor,
@@ -133,18 +130,17 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return origin(region);
     }
 
-    // 收集实体和它的 BlockSource，延迟到并行阶段执行
     pt.collectActor(this, region);
-    return true; // 假装 tick 成功，实际在并行阶段执行
+    return true;
 }
 
-// --- 并行派发核心 Hook ---
+// --- Level::$tick 外层 Hook，负责开关收集 + 并行派发 ---
 
-LL_AUTO_TYPE_INSTANCE_HOOK(
-    ParallelTickDispatchHook,
+LL_TYPE_INSTANCE_HOOK(
+    ParallelLevelTickHook,
     ll::memory::HookPriority::Normal,
-    ServerLevel,
-    &ServerLevel::$tickEntities,
+    Level,
+    &Level::$tick,
     void
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
@@ -167,7 +163,9 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
     if (list.empty()) return;
 
-    struct Groups { std::vector<parallel_tick::ActorTickEntry> phase[4]; } groups;
+    struct Groups {
+        std::vector<parallel_tick::ActorTickEntry> phase[4];
+    } groups;
 
     for (auto& entry : list) {
         if (!entry.actor) continue;
@@ -204,9 +202,13 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                     if (conf.debug) {
                         auto typeId   = (int)entry.actor->getEntityTypeId();
                         auto entityId = entry.actor->getRuntimeID().rawID;
-                        pt.getSelf().getLogger().info("Ticking typeId={} id={}", typeId, entityId);
+                        pt.getSelf().getLogger().info(
+                            "Ticking typeId={} id={}", typeId, entityId
+                        );
                         entry.actor->tick(*entry.region);
-                        pt.getSelf().getLogger().info("Done    typeId={} id={}", typeId, entityId);
+                        pt.getSelf().getLogger().info(
+                            "Done    typeId={} id={}", typeId, entityId
+                        );
                     } else {
                         entry.actor->tick(*entry.region);
                     }
@@ -216,6 +218,24 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
         pool.waitAll();
     }
+}
+
+// --- 注册/注销 ---
+
+void registerHooks() {
+    ParallelAddEntityLock::hook();
+    ParallelRemoveActorLock::hook();
+    ParallelRemoveWeakRefLock::hook();
+    ParallelActorTickHook::hook();
+    ParallelLevelTickHook::hook();
+}
+
+void unregisterHooks() {
+    ParallelAddEntityLock::unhook();
+    ParallelRemoveActorLock::unhook();
+    ParallelRemoveWeakRefLock::unhook();
+    ParallelActorTickHook::unhook();
+    ParallelLevelTickHook::unhook();
 }
 
 LL_REGISTER_MOD(parallel_tick::ParallelTick, parallel_tick::ParallelTick::getInstance());
