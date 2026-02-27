@@ -381,13 +381,13 @@ LL_TYPE_INSTANCE_HOOK(
                     } catch (const std::exception& e) {
                         pt.getSelf().getLogger().error(
                             "[{}][ParallelTick][Task] Exception during tick: typeId={}, id={}, what={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
-                            currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, dimId
+                            currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, (int)dimId  // 强制转换为 int
                         );
                         // 跳过此实体，继续处理下一个
                     } catch (...) {
                         pt.getSelf().getLogger().error(
                             "[{}][ParallelTick][Task] Unknown exception during tick: typeId={}, id={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
-                            currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, dimId
+                            currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, (int)dimId  // 强制转换为 int
                         );
                         // 跳过此实体，继续处理下一个
                     }
