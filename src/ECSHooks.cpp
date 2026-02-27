@@ -28,7 +28,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     inst.setParallelPhase(true);
 
-    // 收集所有非玩家生物（假设 Level 有 forEachEntity 方法，若无则需改用其他方式）
+    // 收集所有非玩家生物
     std::vector<Actor*> entities;
     this->forEachEntity([&](Actor& actor) -> bool {
         if (actor.isMob() && !actor.isPlayer() && inst.isActorSafeToTick(&actor)) {
@@ -52,7 +52,7 @@ LL_TYPE_INSTANCE_HOOK(
                     inst.markCrashed(actor);
                     inst.getSelf().getLogger().error(
                         "Actor {} crashed during parallel tick",
-                        actor->getUniqueID().rawID
+                        actor->getOrCreateUniqueID().rawID
                     );
                 }
             }
