@@ -66,6 +66,18 @@ public:
         });
     }
 
+    // 带超时的 waitAll，返回 false 表示超时
+    bool waitAllFor(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mDoneMutex);
+        return mDoneCv.wait_for(lock, timeout, [this] {
+            return mPending.load(std::memory_order_acquire) == 0;
+        });
+    }
+
+    int pendingCount() const {
+        return mPending.load(std::memory_order_acquire);
+    }
+
 private:
     void workerLoop() {
         while (true) {
@@ -101,5 +113,5 @@ private:
     std::mutex                        mDoneMutex;
     std::condition_variable           mDoneCv;
     std::atomic<int>                  mPending;
-    std::atomic<bool>                 mStop;       // 修复：改为 atomic
+    std::atomic<bool>                 mStop;
 };
