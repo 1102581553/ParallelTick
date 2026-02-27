@@ -10,7 +10,7 @@
 
 namespace parallel_tick {
 
-// 假设 Hook Level::tick (实际可能不同，请根据 LeviLamina 版本调整)
+// Hook Level::tick 函数（虚函数，取地址正确写法：&Level::tick）
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
