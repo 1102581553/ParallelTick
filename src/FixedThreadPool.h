@@ -8,11 +8,12 @@
 #include <vector>
 #include <cstdio>
 
+// SEH 安全调用 — 独立非内联函数，内部无 C++ 析构对象
 static int invokeWithSEH(std::function<void()>& f) {
     __try {
         f();
         return 0;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
 }
@@ -28,9 +29,9 @@ public:
             HANDLE h = CreateThread(
                 nullptr, stackSize,
                 [](LPVOID p) -> DWORD {
-                    auto* param = static_cast<Param*>(p);
-                    param->pool->workerLoop();
-                    delete param;
+                    auto* pp = static_cast<Param*>(p);
+                    pp->pool->workerLoop();
+                    delete pp;
                     return 0;
                 },
                 param, 0, nullptr
@@ -41,10 +42,7 @@ public:
     }
 
     ~FixedThreadPool() {
-        {
-            std::lock_guard<std::mutex> lock(mMutex);
-            mStop = true;
-        }
+        mStop.store(true, std::memory_order_release);
         mCv.notify_all();
         for (auto h : mWorkers) {
             WaitForSingleObject(h, INFINITE);
@@ -53,7 +51,7 @@ public:
     }
 
     void submit(std::function<void()> f) {
-        ++mPending;
+        mPending.fetch_add(1, std::memory_order_acq_rel);
         {
             std::lock_guard<std::mutex> lock(mMutex);
             mTasks.push(std::move(f));
@@ -63,7 +61,9 @@ public:
 
     void waitAll() {
         std::unique_lock<std::mutex> lock(mDoneMutex);
-        mDoneCv.wait(lock, [this] { return mPending.load() == 0; });
+        mDoneCv.wait(lock, [this] {
+            return mPending.load(std::memory_order_acquire) == 0;
+        });
     }
 
 private:
@@ -72,8 +72,12 @@ private:
             std::function<void()> task;
             {
                 std::unique_lock<std::mutex> lock(mMutex);
-                mCv.wait(lock, [this] { return mStop || !mTasks.empty(); });
-                if (mStop && mTasks.empty()) return;
+                mCv.wait(lock, [this] {
+                    return mStop.load(std::memory_order_acquire)
+                        || !mTasks.empty();
+                });
+                if (mStop.load(std::memory_order_acquire) && mTasks.empty())
+                    return;
                 task = std::move(mTasks.front());
                 mTasks.pop();
             }
@@ -83,7 +87,7 @@ private:
                     "[FixedThreadPool] SEH 0x%08X in task\n",
                     static_cast<unsigned>(exCode));
             }
-            if (--mPending == 0) {
+            if (mPending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 std::lock_guard<std::mutex> lock(mDoneMutex);
                 mDoneCv.notify_all();
             }
@@ -97,5 +101,5 @@ private:
     std::mutex                        mDoneMutex;
     std::condition_variable           mDoneCv;
     std::atomic<int>                  mPending;
-    bool                              mStop;
+    std::atomic<bool>                 mStop;       // 修复：改为 atomic
 };
