@@ -61,16 +61,12 @@ public:
     int  getAutoMaxEntities() const  { return mAutoMaxEntities.load(); }
     void setAutoMaxEntities(int val) { mAutoMaxEntities.store(val); }
 
-    // 收集实体（主线程调用）
     void collectActor(Actor* actor, BlockSource& region) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         mPendingQueue.push_back({actor, &region});
         mLiveActors.insert(actor);
     }
 
-    // removeEntity Hook 调用
-    // 并行 tick 期间：挂起移除，等 waitAll 后统一清理
-    // 非 tick 期间：直接移除
     void onActorRemoved(Actor* actor) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         if (mTickingNow.load()) {
@@ -80,16 +76,12 @@ public:
         }
     }
 
-    // waitAll 后在主线程调用，统一清理挂起的移除
     void flushPendingRemove() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
-        for (auto* a : mPendingRemove) {
-            mLiveActors.erase(a);
-        }
+        for (auto* a : mPendingRemove) mLiveActors.erase(a);
         mPendingRemove.clear();
     }
 
-    // 仅在主线程持锁时调用
     bool isActorAlive(Actor* actor) {
         return mLiveActors.count(actor) > 0;
     }
@@ -103,6 +95,24 @@ public:
     std::vector<ActorTickEntry> takeQueue() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         return std::move(mPendingQueue);
+    }
+
+    // 标记实体已被并行 tick（工作线程调用，需加锁）
+    void markTicked(Actor* actor) {
+        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        mAlreadyTicked.insert(actor);
+    }
+
+    // 检查实体是否已被并行 tick（主线程二次 tick 拦截时调用）
+    bool wasTicked(Actor* actor) {
+        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        return mAlreadyTicked.count(actor) > 0;
+    }
+
+    // waitAll 后清理（主线程调用）
+    void clearTicked() {
+        std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
+        mAlreadyTicked.clear();
     }
 
     bool isCollecting() const  { return mCollecting.load(); }
@@ -132,6 +142,7 @@ private:
     std::vector<ActorTickEntry> mPendingQueue;
     std::unordered_set<Actor*>  mLiveActors;
     std::unordered_set<Actor*>  mPendingRemove;
+    std::unordered_set<Actor*>  mAlreadyTicked;  // ← 新增
 
     std::atomic<size_t> mTotalStats{0};
     std::atomic<size_t> mParallelStats{0};
