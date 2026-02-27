@@ -1,10 +1,11 @@
 #pragma once
 #include <ll/api/mod/NativeMod.h>
 #include <ll/api/io/Logger.h>
-#include <mutex>          // 使用 recursive_mutex
+#include <mutex>
 #include <atomic>
 #include <vector>
 #include <unordered_set>
+#include <memory>
 #include "Config.h"
 #include "FixedThreadPool.h"
 
@@ -27,7 +28,7 @@ public:
 
     ParallelTick()
     : mSelf(*ll::mod::NativeMod::current()),
-      mPool(std::max(1u, std::thread::hardware_concurrency() - 1)) {}
+      mPool(nullptr) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
@@ -37,34 +38,29 @@ public:
 
     Config&            getConfig()         { return mConfig; }
     std::recursive_mutex& getLifecycleMutex() { return mLifecycleMutex; }
-    FixedThreadPool&   getPool()           { return mPool; }
+    FixedThreadPool&   getPool()           { return *mPool; }
 
-    // 收集实体：写锁保护下将实体加入队列和存活集合
     void collectActor(Actor* actor, BlockSource& region) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         mPendingQueue.push_back({actor, &region});
         mLiveActors.insert(actor);
     }
 
-    // 实体移除时从存活集合中删除（写锁保护）
     void onActorRemoved(Actor* actor) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         mLiveActors.erase(actor);
     }
 
-    // 检查实体是否存活（由于递归互斥量不支持共享锁，这里也加独占锁）
     bool isActorAlive(Actor* actor) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         return mLiveActors.count(actor) > 0;
     }
 
-    // 清空存活集合（写锁保护）
     void clearLive() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         mLiveActors.clear();
     }
 
-    // 取出队列并清空（写锁保护）
     std::vector<ActorTickEntry> takeQueue() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         return std::move(mPendingQueue);
@@ -80,14 +76,13 @@ public:
     }
 
 private:
-    void startDebugTask();
-    void stopDebugTask();
+    void startStatsTask();
+    void stopStatsTask();
 
     ll::mod::NativeMod&             mSelf;
     Config                          mConfig;
-    // 使用递归互斥量，允许同一线程递归加锁
     std::recursive_mutex            mLifecycleMutex;
-    FixedThreadPool                 mPool;
+    std::unique_ptr<FixedThreadPool> mPool;
 
     std::atomic<bool>               mCollecting{false};
     std::vector<ActorTickEntry>     mPendingQueue;
@@ -95,7 +90,7 @@ private:
 
     std::atomic<size_t>             mPhaseStats[4] = {0, 0, 0, 0};
     std::atomic<size_t>             mUnsafeStats   = 0;
-    std::atomic<bool>               mDebugTaskRunning{false};
+    std::atomic<bool>               mStatsTaskRunning{false};
 };
 
 } // namespace parallel_tick
