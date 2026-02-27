@@ -7,14 +7,41 @@
 #include <atomic>
 #include <vector>
 #include <cstdio>
+#include <exception>
 
-// SEH 安全调用 — 独立非内联函数，内部无 C++ 析构对象
+// ================================================================
+// SEH 过滤器：关键修复
+//
+// 0xE06D7363 = MSVC C++ 异常的 SEH 代码
+// 必须让它穿透 __except，由外层 C++ try-catch 正确处理
+// 否则栈展开被跳过 → 析构函数不跑 → 状态损坏
+// ================================================================
+static LONG sehFilterNoCpp(unsigned int code) {
+    if (code == 0xE06D7363u)          // C++ 异常 → 不拦截
+        return EXCEPTION_CONTINUE_SEARCH;
+    return EXCEPTION_EXECUTE_HANDLER;  // 硬件异常 → 拦截
+}
+
+// SEH 安全调用（只捕获硬件异常，不捕获 C++ 异常）
 static int invokeWithSEH(std::function<void()>& f) {
     __try {
         f();
         return 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return GetExceptionCode();
+    } __except (sehFilterNoCpp(GetExceptionCode())) {
+        return static_cast<int>(GetExceptionCode());
+    }
+}
+
+// 完整安全调用（SEH + C++ 异常）
+static int invokeFullySafe(std::function<void()>& f) {
+    try {
+        return invokeWithSEH(f);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[FixedThreadPool] C++ exception: %s\n", e.what());
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "[FixedThreadPool] Unknown C++ exception\n");
+        return -2;
     }
 }
 
@@ -66,7 +93,6 @@ public:
         });
     }
 
-    // 带超时的 waitAll，返回 false 表示超时
     bool waitAllFor(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mDoneMutex);
         return mDoneCv.wait_for(lock, timeout, [this] {
@@ -93,10 +119,11 @@ private:
                 task = std::move(mTasks.front());
                 mTasks.pop();
             }
-            int exCode = invokeWithSEH(task);
+            // 使用完整安全调用：C++ 异常走 try-catch 正常展开
+            int exCode = invokeFullySafe(task);
             if (exCode != 0) {
                 fprintf(stderr,
-                    "[FixedThreadPool] SEH 0x%08X in task\n",
+                    "[FixedThreadPool] Task failed with code 0x%08X\n",
                     static_cast<unsigned>(exCode));
             }
             if (mPending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
