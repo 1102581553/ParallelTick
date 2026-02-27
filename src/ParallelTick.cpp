@@ -12,7 +12,6 @@
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
 #include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
-
 #include <mc/legacy/ActorRuntimeID.h>
 
 #include <cmath>
@@ -117,8 +116,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 }
 
 // --- 并行派发核心 Hook ---
-// Hook ServerLevel::$tickEntities，这是专门负责 tick 所有实体的函数
-// 符号为 MCAPI，链接不会失败
 #pragma warning(push)
 #pragma warning(disable: 4996)
 LL_AUTO_TYPE_INSTANCE_HOOK(
@@ -136,7 +133,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // getRuntimeActorList() 直接从 this 调用，不需要 ll::service::getLevel()
     parallel_tick::ParallelGroups groups;
 
     {
@@ -171,7 +167,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         );
     }
 
-    // 并行阶段（同色格子间无空间相邻，可以安全并行）
+    // 并行阶段
     for (int p = 0; p < 4; ++p) {
         auto& list = groups.phase[p];
         if (list.empty()) continue;
@@ -184,37 +180,50 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             size_t  batchCount = end - i;
 
             futures.push_back(std::async(std::launch::async,
-                [&pt, batchBegin, batchCount]() {
+                [&pt, &conf, batchBegin, batchCount]() {
                     std::shared_lock lock(pt.getLifecycleMutex());
                     for (size_t j = 0; j < batchCount; ++j) {
                         Actor* actor = batchBegin[j];
                         if (!actor) continue;
-                        
-                        // 崩溃前最后输出的就是问题实体
-                        auto typeId   = (int)actor->getEntityTypeId();
-                        auto entityId = actor->getRuntimeID().rawID;
-                        
-                        parallel_tick::ParallelTick::getInstance().getSelf().getLogger().debug(
-                            "Ticking entity: typeId={} runtimeId={}", typeId, entityId
-                        );
-                        
-                        actor->normalTick();
-                        
-                        parallel_tick::ParallelTick::getInstance().getSelf().getLogger().debug(
-                            "Done entity: typeId={} runtimeId={}", typeId, entityId
-                        );
+
+                        if (conf.debug) {
+                            auto typeId   = (int)actor->getEntityTypeId();
+                            auto entityId = actor->getRuntimeID().rawID;
+                            pt.getSelf().getLogger().debug(
+                                "Ticking typeId={} id={}", typeId, entityId
+                            );
+                            actor->normalTick();
+                            pt.getSelf().getLogger().debug(
+                                "Done    typeId={} id={}", typeId, entityId
+                            );
+                        } else {
+                            actor->normalTick();
+                        }
                     }
                 }
             ));
-
         }
 
         for (auto& f : futures) f.get();
     }
 
-    // 串行阶段（玩家、模拟玩家等需要主线程的实体）
+    // 串行阶段
     for (auto* actor : groups.unsafe) {
-        if (actor) actor->normalTick();
+        if (!actor) continue;
+
+        if (conf.debug) {
+            auto typeId   = (int)actor->getEntityTypeId();
+            auto entityId = actor->getRuntimeID().rawID;
+            pt.getSelf().getLogger().debug(
+                "Serial typeId={} id={}", typeId, entityId
+            );
+            actor->normalTick();
+            pt.getSelf().getLogger().debug(
+                "Serial Done typeId={} id={}", typeId, entityId
+            );
+        } else {
+            actor->normalTick();
+        }
     }
 }
 #pragma warning(pop)
