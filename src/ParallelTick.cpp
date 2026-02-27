@@ -4,6 +4,7 @@
 #include <ll/api/coro/CoroTask.h>
 #include <ll/api/thread/ServerThreadExecutor.h>
 #include <ll/api/mod/RegisterHelper.h>
+#include <ll/api/Config.h>
 
 #include <mc/world/level/Level.h>
 #include <mc/world/actor/Actor.h>
@@ -20,32 +21,29 @@
 #include <queue>
 #include <unordered_map>
 #include <cstdio>
+#include <array>
 
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext>(Level::*)(::Actor&);
 using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext>(Level::*)(::WeakEntityRef);
 
-// ----------------------------------------------------------------
-// SEH 安全 tick
-// 独立非内联函数，内部不含任何 C++ 析构对象
-// ----------------------------------------------------------------
+// ── SEH 安全 tick（独立非内联函数，无 C++ 析构对象）──
 static int tickActorSafe(Actor* actor, BlockSource& region) {
     __try {
         actor->tick(region);
         return 0;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
 }
 
 namespace parallel_tick {
 
-// ----------------------------------------------------------------
-// 工具
-// ----------------------------------------------------------------
+// ── 工具 ──
 static std::string currentTimeString() {
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
-    tm buf; localtime_s(&buf, &t);
+    tm buf;
+    localtime_s(&buf, &t);
     std::ostringstream ss;
     ss << std::put_time(&buf, "%H:%M:%S");
     return ss.str();
@@ -58,17 +56,13 @@ static Actor* tryGetActorFromWeakRef(WeakEntityRef const& ref) {
     return nullptr;
 }
 
-// ----------------------------------------------------------------
-// 单例
-// ----------------------------------------------------------------
+// ── 单例 ──
 ParallelTick& ParallelTick::getInstance() {
     static ParallelTick inst;
     return inst;
 }
 
-// ----------------------------------------------------------------
-// 统计
-// ----------------------------------------------------------------
+// ── 统计协程 ──
 void ParallelTick::startStatsTask() {
     if (mStatsTaskRunning.exchange(true)) return;
     ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
@@ -77,11 +71,11 @@ void ParallelTick::startStatsTask() {
             ll::thread::ServerThreadExecutor::getDefault().execute([this] {
                 if (!mConfig.stats) return;
                 size_t tot = mTotalStats.exchange(0);
-                size_t par = mParallelStats.exchange(0);
+                size_t ph  = mPhaseStats.exchange(0);
                 if (tot > 0)
                     getSelf().getLogger().info(
-                        "[{}][ParallelStats] Total={}, Tasks={}",
-                        currentTimeString(), tot, par);
+                        "[{}][Stats] Total={} Phases={}",
+                        currentTimeString(), tot, ph);
             });
         }
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
@@ -89,17 +83,14 @@ void ParallelTick::startStatsTask() {
 
 void ParallelTick::stopStatsTask() { mStatsTaskRunning.store(false); }
 
-// ----------------------------------------------------------------
-// 生命周期
-// ----------------------------------------------------------------
+// ── 生命周期 ──
 bool ParallelTick::load() {
     auto path = getSelf().getConfigDir() / "config.json";
     if (!ll::config::loadConfig(mConfig, path))
         ll::config::saveConfig(mConfig, path);
     mAutoMaxEntities.store(mConfig.maxEntitiesPerTask);
     getSelf().getLogger().info(
-        "[{}][ParallelTick::load] enabled={} debug={} threads={} "
-        "maxEntities={} gridBase={} autoAdjust={} targetMs={}",
+        "[{}][load] enabled={} debug={} threads={} maxE={} grid={} auto={} target={}ms",
         currentTimeString(), mConfig.enabled, mConfig.debug,
         mConfig.threadCount, mConfig.maxEntitiesPerTask,
         mConfig.gridSizeBase, mConfig.autoAdjust, mConfig.targetTickMs);
@@ -109,10 +100,10 @@ bool ParallelTick::load() {
 bool ParallelTick::enable() {
     int n = mConfig.threadCount;
     if (n <= 0) n = std::max(1u, std::thread::hardware_concurrency() - 1);
-    mPool = std::make_unique<FixedThreadPool>(n, 8*1024*1024);
+    mPool = std::make_unique<FixedThreadPool>(n, 8 * 1024 * 1024);
     registerHooks();
     getSelf().getLogger().info(
-        "[{}][ParallelTick::enable] threads={}", currentTimeString(), n);
+        "[{}][enable] threads={}", currentTimeString(), n);
     if (mConfig.stats || mConfig.debug) startStatsTask();
     return true;
 }
@@ -122,19 +113,16 @@ bool ParallelTick::disable() {
     stopStatsTask();
     mPool.reset();
     getSelf().getLogger().info(
-        "[{}][ParallelTick::disable] Done", currentTimeString());
+        "[{}][disable] Done", currentTimeString());
     return true;
 }
 
 // ================================================================
-// Hook 实现
+//  Hook 实现
 // ================================================================
 
-// ----------------------------------------------------------------
-// removeEntity（两个重载）
-// 直接从 liveActors 移除，无论是否在并行期间
-// 因为：并行期间工作线程会在 tick 前检查 isInWorld()
-// ----------------------------------------------------------------
+// ── removeEntity（两个重载）──
+// 并行阶段通过 LevelMutex 串行化 origin 调用
 LL_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
     ll::memory::HookPriority::Normal,
@@ -143,7 +131,13 @@ LL_TYPE_INSTANCE_HOOK(
     ::OwnerPtr<::EntityContext>,
     ::Actor& actor
 ) {
-    parallel_tick::ParallelTick::getInstance().onActorRemoved(&actor);
+    auto& pt = ParallelTick::getInstance();
+    pt.onActorRemoved(&actor);
+
+    if (pt.isParallelPhase()) {
+        std::lock_guard<std::mutex> lk(pt.getLevelMutex());
+        return origin(actor);
+    }
     return origin(actor);
 }
 
@@ -155,16 +149,19 @@ LL_TYPE_INSTANCE_HOOK(
     ::OwnerPtr<::EntityContext>,
     ::WeakEntityRef entityRef
 ) {
+    auto& pt = ParallelTick::getInstance();
     if (Actor* a = tryGetActorFromWeakRef(entityRef))
-        parallel_tick::ParallelTick::getInstance().onActorRemoved(a);
+        pt.onActorRemoved(a);
+
+    if (pt.isParallelPhase()) {
+        std::lock_guard<std::mutex> lk(pt.getLevelMutex());
+        return origin(std::move(entityRef));
+    }
     return origin(std::move(entityRef));
 }
 
-// ----------------------------------------------------------------
-// Actor::tick Hook
-// 收集阶段：拦截所有非玩家实体，收集入队，返回 true 阻止 origin
-// 非收集阶段：直接走 origin（不做任何干预）
-// ----------------------------------------------------------------
+// ── Actor::tick Hook ──
+// 收集阶段：拦截非玩家实体入队，不执行 origin
 LL_TYPE_INSTANCE_HOOK(
     ParallelActorTickHook,
     ll::memory::HookPriority::Normal,
@@ -173,8 +170,8 @@ LL_TYPE_INSTANCE_HOOK(
     bool,
     ::BlockSource& region
 ) {
-    auto& pt   = parallel_tick::ParallelTick::getInstance();
-    auto& conf = pt.getConfig();
+    auto& pt        = ParallelTick::getInstance();
+    const auto& conf = pt.getConfig();
 
     if (!conf.enabled || !pt.isCollecting())
         return origin(region);
@@ -183,32 +180,37 @@ LL_TYPE_INSTANCE_HOOK(
     if (this->isPlayer() || this->isSimulatedPlayer())
         return origin(region);
 
-    // 收集入队，不调用 origin
+    // 已崩溃实体永久跳过
+    if (pt.isCrashed(this))
+        return true;
+
     pt.collectActor(this, region);
 
     if (conf.debug)
         pt.getSelf().getLogger().info(
-            "[{}][ActorTickHook] Collected actor={:p} typeId={} region={:p}",
+            "[{}][Collect] actor={:p} type={}",
             currentTimeString(), (void*)this,
-            static_cast<int>(this->getEntityTypeId()), (void*)&region);
+            static_cast<int>(this->getEntityTypeId()));
 
     return true;
 }
 
-// ----------------------------------------------------------------
-// Level::$tick Hook
+// ── Level::$tick Hook ──
 //
-// 关键设计：
-//   1. 先执行 origin()（期间收集实体，阻止其 tick）
-//      origin() 完成后，MCBE 已完成所有非实体的 Level/Dimension 逻辑
-//   2. 工作线程并行 tick 收集到的实体
-//   3. waitAll() 确保全部完成
+// 核心设计：4-色棋盘分相并行
 //
-// 为什么这样是安全的：
-//   - origin() 执行时，实体 tick 全部被 Hook 拦截，没有任何实体实际被 tick
-//   - 工作线程 tick 时，origin() 已返回，主线程不再访问 BlockSource
-//   - 两个阶段完全串行，不存在并发访问 BlockSource
-// ----------------------------------------------------------------
+//   网格坐标 (gx, gz) 着色: color = (gx%2)*2 + (gz%2)，共 4 色
+//   同色网格在 X 和 Z 方向上间距 ≥ 2 个网格 = 2 * gridSizeBase
+//   gridSizeBase=64 时，同色网格间距 ≥ 128 格，远超任何实体交互半径
+//
+//   执行顺序：
+//     Phase 0 → waitAll → Phase 1 → waitAll → Phase 2 → waitAll → Phase 3 → waitAll
+//
+//   同一 Phase 内的所有任务可安全并行：
+//     - 不会访问相同的区块（空间距离 ≥ 128 格）
+//     - 不会互相交互（超出最大交互距离）
+//     - Level 全局变更（addEntity/removeEntity）通过 LevelMutex 串行化
+//
 LL_TYPE_INSTANCE_HOOK(
     ParallelLevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -216,13 +218,14 @@ LL_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
+    // 防重入
     static thread_local bool inTick = false;
     if (inTick) { origin(); return; }
     inTick = true;
 
-    auto& pt        = parallel_tick::ParallelTick::getInstance();
-    auto  conf      = pt.getConfig();
-    auto  tickStart = std::chrono::steady_clock::now();
+    auto& pt         = ParallelTick::getInstance();
+    const auto& conf = pt.getConfig();
+    auto  tickStart  = std::chrono::steady_clock::now();
 
     if (!conf.enabled) {
         origin();
@@ -230,14 +233,15 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段1：执行 origin()，收集实体 ──────────────────────────
-    // Actor::tick Hook 在此期间拦截所有非玩家实体入队
-    // origin() 内部的所有其他逻辑（红石、区块、天气等）正常执行
-    // 实体 tick 被完全阻止，工作线程此时未启动
+    // ════════════════════════════════════════════════════════
+    //  阶段 1：收集实体
+    //  origin() 内部遍历实体 → Actor::tick Hook 拦截入队
+    //  origin() 完成后，MCBE 的非实体逻辑（红石/区块/天气等）已执行
+    //  所有非玩家实体的 tick 被拦截，未实际执行
+    // ════════════════════════════════════════════════════════
     pt.setCollecting(true);
     origin();
     pt.setCollecting(false);
-    // ← 此处 origin() 已返回，主线程不再持有任何 BlockSource 操作
 
     auto list = pt.takeQueue();
 
@@ -247,20 +251,21 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段2：快照过滤 ──────────────────────────────────────────
-    // 过滤在收集阶段被移除的实体（onActorRemoved 已从 liveActors 擦除）
+    // ════════════════════════════════════════════════════════
+    //  阶段 2：过滤已移除 / 已崩溃的实体
+    // ════════════════════════════════════════════════════════
     std::vector<ActorTickEntry> snapshot;
     snapshot.reserve(list.size());
-    {
-        std::unique_lock<std::recursive_mutex> lk(pt.getLifecycleMutex());
-        for (auto& e : list)
-            if (e.actor && pt.isActorAlive(e.actor))
-                snapshot.push_back(e);
+    for (auto& e : list) {
+        if (!e.actor) continue;
+        if (!pt.isActorSafeToTick(e.actor)) continue;
+        if (pt.isCrashed(e.actor)) continue;
+        snapshot.push_back(e);
     }
 
     if (conf.debug)
         pt.getSelf().getLogger().info(
-            "[{}][ParallelTick] snapshot={} / queued={}",
+            "[{}][Filter] {} / {} passed",
             currentTimeString(), snapshot.size(), list.size());
 
     if (snapshot.empty()) {
@@ -269,133 +274,186 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段3：按 BlockSource 分组 ───────────────────────────────
-    std::unordered_map<BlockSource*, std::vector<ActorTickEntry>> bsMap;
-    for (auto& e : snapshot) bsMap[e.region].push_back(e);
+    // ════════════════════════════════════════════════════════
+    //  阶段 3：按 BlockSource 分组 → 网格分区 → 4-色着色
+    // ════════════════════════════════════════════════════════
 
-    // ── 阶段4：网格分区 + BFS 合并成任务 ────────────────────────
+    // 结构：phases[color] = vector<Task>
+    // Task = { BlockSource*, vector<ActorTickEntry> }
+    struct Task {
+        BlockSource*              bs;
+        std::vector<ActorTickEntry> entries;
+    };
+    std::array<std::vector<Task>, 4> phases;
+
+    // 按 BlockSource 分组
+    std::unordered_map<BlockSource*, std::vector<ActorTickEntry>> bsMap;
+    for (auto& e : snapshot)
+        bsMap[e.region].push_back(e);
+
     int curMax = conf.autoAdjust
                ? pt.getAutoMaxEntities()
                : conf.maxEntitiesPerTask;
 
-    struct Task { BlockSource* bs; std::vector<ActorTickEntry> entries; };
-    std::vector<Task> taskList;
+    size_t totalTasks = 0;
 
     for (auto& [bs, entries] : bsMap) {
+        // 按网格坐标分桶
         std::unordered_map<GridPos, std::vector<ActorTickEntry>, GridPosHash> gridMap;
         for (auto& e : entries) {
             auto pos = e.actor->getPosition();
-            gridMap[{
+            GridPos gp{
                 static_cast<int>(std::floor(pos.x / conf.gridSizeBase)),
                 static_cast<int>(std::floor(pos.z / conf.gridSizeBase))
-            }].push_back(e);
+            };
+            gridMap[gp].push_back(e);
         }
 
-        std::unordered_set<GridPos, GridPosHash> visited;
+        // 每个网格按 color 分入对应 phase
+        // 同一 color 内，如果单个网格实体数 > curMax，拆分成多个 Task
         for (auto& [gp, ge] : gridMap) {
-            if (visited.count(gp)) continue;
-            std::queue<GridPos> q;
-            q.push(gp); visited.insert(gp);
-            std::vector<ActorTickEntry> block(ge.begin(), ge.end());
-            while (!q.empty()) {
-                auto cur = q.front(); q.pop();
-                for (auto& nb : std::initializer_list<GridPos>{
-                    {cur.x+1,cur.z},{cur.x-1,cur.z},
-                    {cur.x,cur.z+1},{cur.x,cur.z-1}}) {
-                    auto it = gridMap.find(nb);
-                    if (it != gridMap.end() && !visited.count(nb)
-                        && block.size()+it->second.size()
-                           <= static_cast<size_t>(curMax)) {
-                        block.insert(block.end(),
-                            it->second.begin(), it->second.end());
-                        visited.insert(nb);
-                        q.push(nb);
-                    }
+            int color = gridColor(gp);
+
+            if (static_cast<int>(ge.size()) <= curMax) {
+                phases[color].push_back({bs, std::move(ge)});
+                totalTasks++;
+            } else {
+                // 拆分大网格
+                for (size_t i = 0; i < ge.size(); i += curMax) {
+                    size_t end = std::min(i + static_cast<size_t>(curMax), ge.size());
+                    std::vector<ActorTickEntry> chunk(ge.begin() + i, ge.begin() + end);
+                    phases[color].push_back({bs, std::move(chunk)});
+                    totalTasks++;
                 }
             }
-            taskList.push_back({bs, std::move(block)});
         }
     }
 
-    pt.addStats(snapshot.size(), taskList.size());
+    pt.addStats(snapshot.size(), totalTasks);
 
     if (conf.debug)
         pt.getSelf().getLogger().info(
-            "[{}][ParallelTick] Submitting {} tasks / {} entities / {} BS",
-            currentTimeString(), taskList.size(),
-            snapshot.size(), bsMap.size());
+            "[{}][Grid] {} entities → {} tasks, phases=[{},{},{},{}], {} BS",
+            currentTimeString(), snapshot.size(), totalTasks,
+            phases[0].size(), phases[1].size(),
+            phases[2].size(), phases[3].size(),
+            bsMap.size());
 
-    // ── 阶段5：并行 tick ─────────────────────────────────────────
-    // 此时 origin() 已返回，主线程不再访问 BlockSource
-    // 工作线程可以安全地并行 tick 实体
+    // ════════════════════════════════════════════════════════
+    //  阶段 4：逐相位并行执行
+    //
+    //  同一相位内的所有网格间距 ≥ 2*gridSizeBase（128格）
+    //  → 不可能访问相同区块
+    //  → 不可能互相交互（远超最大交互距离）
+    //
+    //  相位之间有 barrier（waitAll），确保串行
+    //
+    //  Level 全局变更（removeEntity 等）通过 LevelMutex 串行化
+    // ════════════════════════════════════════════════════════
+    pt.setParallelPhase(true);
     auto& pool = pt.getPool();
-    for (auto& task : taskList) {
-        pool.submit([&pt, conf, task = std::move(task)]() mutable {
-            for (auto& e : task.entries) {
-                if (!e.actor || !e.actor->isInWorld()) continue;
 
-                if (conf.debug)
-                    pt.getSelf().getLogger().info(
-                        "[{}][Task] Tick actor={:p} typeId={} id={}",
-                        currentTimeString(), (void*)e.actor,
-                        static_cast<int>(e.actor->getEntityTypeId()),
-                        e.actor->getRuntimeID().rawID);
+    for (int color = 0; color < 4; ++color) {
+        auto& phaseTasks = phases[color];
+        if (phaseTasks.empty()) continue;
 
-                int ex = tickActorSafe(e.actor, *e.region);
-                if (ex != 0) {
-                    fprintf(stderr,
-                        "[ParallelTick][Task] SEH 0x%08X actor=%p\n",
-                        static_cast<unsigned>(ex), (void*)e.actor);
+        if (conf.debug)
+            pt.getSelf().getLogger().info(
+                "[{}][Phase {}] Submitting {} tasks",
+                currentTimeString(), color, phaseTasks.size());
+
+        for (auto& task : phaseTasks) {
+            pool.submit([&pt, &conf, bs = task.bs,
+                         entries = std::move(task.entries)]() mutable
+            {
+                for (auto& e : entries) {
+                    // 在锁内做最终存活检查，消除 TOCTOU
+                    if (!pt.isActorSafeToTick(e.actor)) continue;
+
+                    // 二次检查 isInWorld
+                    if (!e.actor->isInWorld()) continue;
+
                     if (conf.debug)
-                        pt.getSelf().getLogger().warn(
-                            "[Task] SEH 0x{:08X} actor={:p} skipped",
-                            static_cast<unsigned>(ex), (void*)e.actor);
-                } else if (conf.debug) {
-                    pt.getSelf().getLogger().info(
-                        "[{}][Task] Done actor={:p}",
-                        currentTimeString(), (void*)e.actor);
+                        pt.getSelf().getLogger().info(
+                            "[{}][Tick] actor={:p} type={} rid={}",
+                            currentTimeString(), (void*)e.actor,
+                            static_cast<int>(e.actor->getEntityTypeId()),
+                            e.actor->getRuntimeID().rawID);
+
+                    int ex = tickActorSafe(e.actor, *bs);
+
+                    if (ex != 0) {
+                        // SEH 异常：标记该实体永久跳过
+                        // 状态可能已损坏，不能继续 tick 此实体
+                        pt.markCrashed(e.actor);
+                        fprintf(stderr,
+                            "[ParallelTick] SEH 0x%08X actor=%p type=%d — "
+                            "permanently disabled\n",
+                            static_cast<unsigned>(ex),
+                            (void*)e.actor,
+                            static_cast<int>(e.actor->getEntityTypeId()));
+                        if (conf.debug)
+                            pt.getSelf().getLogger().warn(
+                                "[Tick] SEH 0x{:08X} actor={:p} — marked crashed",
+                                static_cast<unsigned>(ex), (void*)e.actor);
+                    } else if (conf.debug) {
+                        pt.getSelf().getLogger().info(
+                            "[{}][Tick] Done actor={:p}",
+                            currentTimeString(), (void*)e.actor);
+                    }
                 }
-            }
-        });
+            });
+        }
+
+        // ── Phase Barrier ──
+        // 等待当前相位所有任务完成后，才开始下一相位
+        pool.waitAll();
+
+        if (conf.debug)
+            pt.getSelf().getLogger().info(
+                "[{}][Phase {}] Complete", currentTimeString(), color);
     }
 
-    // ── 阶段6：等待所有工作线程完成 ─────────────────────────────
-    pool.waitAll();
+    pt.setParallelPhase(false);
 
-    // ── 阶段7：清理 ──────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════
+    //  阶段 5：清理
+    // ════════════════════════════════════════════════════════
     pt.clearAll();
 
-    // ── 阶段8：自动调整 maxEntitiesPerTask ───────────────────────
+    // ════════════════════════════════════════════════════════
+    //  阶段 6：自动调整 maxEntitiesPerTask
+    // ════════════════════════════════════════════════════════
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - tickStart).count();
 
     if (conf.autoAdjust) {
         int oldVal = pt.getAutoMaxEntities();
         int newVal = oldVal;
-        if      (elapsed > conf.targetTickMs + 5)
-            newVal = std::max(conf.minEntitiesPerTask, oldVal - conf.adjustStep);
+        if (elapsed > conf.targetTickMs + 5)
+            newVal = std::max(conf.minEntitiesPerTask,
+                              oldVal - conf.adjustStep);
         else if (elapsed < conf.targetTickMs - 5)
-            newVal = std::min(conf.maxEntitiesPerTaskLimit, oldVal + conf.adjustStep);
+            newVal = std::min(conf.maxEntitiesPerTaskLimit,
+                              oldVal + conf.adjustStep);
         if (newVal != oldVal) {
             pt.setAutoMaxEntities(newVal);
             if (conf.debug)
                 pt.getSelf().getLogger().info(
-                    "[{}][AutoAdjust] {} -> {} ({}ms)",
+                    "[{}][AutoAdjust] {} → {} ({}ms)",
                     currentTimeString(), oldVal, newVal, elapsed);
         }
     }
 
     if (conf.debug)
         pt.getSelf().getLogger().info(
-            "[{}][ParallelLevelTickHook] Exit elapsed={}ms",
+            "[{}][LevelTick] Exit elapsed={}ms",
             currentTimeString(), elapsed);
 
     inTick = false;
 }
 
-// ----------------------------------------------------------------
-// 注册 / 注销
-// ----------------------------------------------------------------
+// ── 注册 / 注销 ──
 void registerHooks() {
     ParallelRemoveActorLock::hook();
     ParallelRemoveWeakRefLock::hook();
@@ -410,6 +468,7 @@ void unregisterHooks() {
     ParallelLevelTickHook::unhook();
 }
 
-LL_REGISTER_MOD(parallel_tick::ParallelTick, parallel_tick::ParallelTick::getInstance());
+LL_REGISTER_MOD(parallel_tick::ParallelTick,
+                parallel_tick::ParallelTick::getInstance());
 
 } // namespace parallel_tick
