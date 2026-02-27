@@ -24,12 +24,14 @@ using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntity
 
 namespace parallel_tick {
 
-// 辅助函数：获取当前时间字符串（用于日志）
+// 辅助函数：获取当前时间字符串（线程安全版本）
 static std::string currentTimeString() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&in_time_t), "%H:%M:%S");
+    tm tm;
+    localtime_s(&tm, &in_time_t);
+    ss << std::put_time(&tm, "%H:%M:%S");
     return ss.str();
 }
 
@@ -123,11 +125,13 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
+    // 先获取写锁
+    std::unique_lock lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Enter, actor={:p}", currentTimeString(), (void*)&actor);
     }
-    pt.onActorRemoved(&actor);
-    std::unique_lock lock(pt.getLifecycleMutex());
+    // 直接从存活集合中移除（不加锁版本）
+    pt.unsafeOnActorRemoved(&actor);
     auto result = origin(actor);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Exit", currentTimeString());
@@ -154,6 +158,8 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
+    // 先获取写锁
+    std::unique_lock lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Enter", currentTimeString());
     }
@@ -161,13 +167,12 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Found actor={:p}, removing", currentTimeString(), (void*)actor);
         }
-        pt.onActorRemoved(actor);
+        pt.unsafeOnActorRemoved(actor);
     } else {
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Failed to get actor from WeakEntityRef", currentTimeString());
         }
     }
-    std::unique_lock lock(pt.getLifecycleMutex());
     auto result = origin(std::move(entityRef));
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveWeakRefLock] Exit", currentTimeString());
@@ -256,14 +261,8 @@ LL_TYPE_INSTANCE_HOOK(
 
     auto list = pt.takeQueue();
 
-    // 队列大小始终输出（如果 debug 为 true，用 info 输出；如果 debug 为 false，也可输出常规信息？这里保留原先逻辑：当 debug 为 true 时输出）
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelTick] Queue size: {}", currentTimeString(), list.size());
-    } else {
-        // 如果 debug 为 false，也可以考虑输出常规队列大小，但根据用户要求“总体只使用info”，且可能只想要受控的调试日志，
-        // 所以此处保留原样：当 debug 为 false 时不输出队列大小（除非你想始终输出）
-        // 此处我们保持与原代码一致：仅在 debug 模式下输出队列大小（因为原代码在 conf.debug 为 true 时用 info 输出）
-        // 如果你希望始终输出队列大小，可以移除 if conf.debug 条件
     }
 
     if (list.empty()) {
@@ -300,7 +299,6 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 始终输出有效实体数量（常规信息）
     pt.getSelf().getLogger().info("[{}][ParallelTick] Valid actors after filtering: {}", currentTimeString(), valid.size());
 
     struct Groups {
@@ -379,7 +377,6 @@ LL_TYPE_INSTANCE_HOOK(
 
                     auto typeId   = (int)entry.actor->getEntityTypeId();
                     auto entityId = entry.actor->getRuntimeID().rawID;
-                    // 始终输出开始 tick 的信息（常规）
                     pt.getSelf().getLogger().info(
                         "[{}][ParallelTick][Task] Starting tick: typeId={}, id={}, actor={:p}, region={:p}",
                         currentTimeString(), typeId, entityId, (void*)entry.actor, (void*)&region
