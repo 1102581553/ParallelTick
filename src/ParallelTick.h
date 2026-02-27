@@ -35,43 +35,11 @@ inline int gridColor(const GridPos& gp) {
 void registerHooks();
 void unregisterHooks();
 
-// ════════════════════════════════════════════════════════════
-//  全局共享操作锁
-//
-//  MCBE 内部在 Actor::tick() 中会调用的共享操作：
-//    - 实体查询（fetchEntities, getEntitiesInAABB...）
-//    - 实体生命周期（addEntity, removeEntity）
-//    - 方块修改（setBlock, neighborChanged）
-//    - 网络广播（broadcastActorEvent）
-//    - 随机数生成器
-//
-//  这些操作被 Hook 并用锁保护
-//  tick 本身并行运行，只在碰到这些操作时短暂串行
-// ════════════════════════════════════════════════════════════
-class SharedLocks {
+// 全局锁：保护 Level 实体列表等跨维度共享状态
+class GlobalLocks {
 public:
-    // 实体查询/迭代 — 高频读，低频写
-    std::shared_mutex entityQueryLock;
-
-    // 实体生命周期 — 写锁
-    std::mutex entityLifecycleLock;
-
-    // 方块修改 — 不同维度可以并行，同维度串行
-    std::unordered_map<BlockSource*, std::mutex> blockWriteLocks;
-    std::mutex blockWriteMapLock;
-
-    std::mutex& getBlockWriteLock(BlockSource* bs) {
-        std::lock_guard<std::mutex> lk(blockWriteMapLock);
-        return blockWriteLocks[bs];
-    }
-
-    // Level 全局状态
-    std::mutex levelGlobalLock;
-
-    // 广播/网络
-    std::mutex networkLock;
-
-    static SharedLocks& get() { static SharedLocks s; return s; }
+    std::mutex entityLifecycleLock;  // addEntity / removeEntity
+    static GlobalLocks& get() { static GlobalLocks s; return s; }
 };
 
 class ParallelTick {
