@@ -22,7 +22,9 @@ struct ActorTickEntry {
 
 struct GridPos {
     int x, z;
-    bool operator==(const GridPos& other) const { return x == other.x && z == other.z; }
+    bool operator==(const GridPos& other) const {
+        return x == other.x && z == other.z;
+    }
 };
 
 struct GridPosHash {
@@ -41,10 +43,10 @@ public:
     static ParallelTick& getInstance();
 
     ParallelTick()
-    : mSelf(*ll::mod::NativeMod::current()),
-      mPool(nullptr),
-      mAutoMaxEntities(256),
-      mTickingNow(false) {}
+        : mSelf(*ll::mod::NativeMod::current()),
+          mPool(nullptr),
+          mAutoMaxEntities(256),
+          mTickingNow(false) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
@@ -67,20 +69,18 @@ public:
     }
 
     // removeEntity Hook 调用
-    // 若当前正在并行 tick，则挂起移除请求，等 waitAll 后主线程统一处理
-    // 若没有在并行 tick，直接标记移除即可
+    // 并行 tick 期间：挂起移除，等 waitAll 后统一清理
+    // 非 tick 期间：直接移除
     void onActorRemoved(Actor* actor) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         if (mTickingNow.load()) {
-            // 并行 tick 期间：挂起，不动 mLiveActors
             mPendingRemove.insert(actor);
         } else {
-            // 非 tick 期间：直接移除
             mLiveActors.erase(actor);
         }
     }
 
-    // waitAll 后在主线程调用，清理挂起的移除
+    // waitAll 后在主线程调用，统一清理挂起的移除
     void flushPendingRemove() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         for (auto* a : mPendingRemove) {
@@ -94,11 +94,6 @@ public:
         return mLiveActors.count(actor) > 0;
     }
 
-    // 从 mLiveActors 移除指定实体（快照过滤后使用）
-    void removeFromLive(Actor* actor) {
-        mLiveActors.erase(actor);
-    }
-
     void clearLive() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         mLiveActors.clear();
@@ -110,12 +105,11 @@ public:
         return std::move(mPendingQueue);
     }
 
-    bool isCollecting() const { return mCollecting.load(); }
+    bool isCollecting() const  { return mCollecting.load(); }
     void setCollecting(bool v) { mCollecting.store(v); }
 
-    // 标记是否正在并行 tick
-    void setTickingNow(bool v) { mTickingNow.store(v); }
     bool isTickingNow() const  { return mTickingNow.load(); }
+    void setTickingNow(bool v) { mTickingNow.store(v); }
 
     void addStats(size_t total, size_t tasks, size_t serial) {
         mTotalStats    += total;
@@ -132,12 +126,12 @@ private:
     std::recursive_mutex             mLifecycleMutex;
     std::unique_ptr<FixedThreadPool> mPool;
 
-    std::atomic<bool>            mCollecting{false};
-    std::atomic<bool>            mTickingNow{false};
+    std::atomic<bool>           mCollecting{false};
+    std::atomic<bool>           mTickingNow{false};
 
-    std::vector<ActorTickEntry>  mPendingQueue;
-    std::unordered_set<Actor*>   mLiveActors;
-    std::unordered_set<Actor*>   mPendingRemove;
+    std::vector<ActorTickEntry> mPendingQueue;
+    std::unordered_set<Actor*>  mLiveActors;
+    std::unordered_set<Actor*>  mPendingRemove;
 
     std::atomic<size_t> mTotalStats{0};
     std::atomic<size_t> mParallelStats{0};
