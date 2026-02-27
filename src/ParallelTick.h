@@ -32,8 +32,6 @@ struct GridPosHash {
     }
 };
 
-// 4-色棋盘：color = ((x%2+2)%2)*2 + ((z%2+2)%2)
-// 同色网格间距 ≥ 2*gridSizeBase，gridSizeBase=64 时 ≥ 128格
 inline int gridColor(const GridPos& gp) {
     int cx = ((gp.x % 2) + 2) % 2;
     int cz = ((gp.z % 2) + 2) % 2;
@@ -64,7 +62,7 @@ public:
     int  getAutoMaxEntities() const  { return mAutoMaxEntities.load(); }
     void setAutoMaxEntities(int v)   { mAutoMaxEntities.store(v); }
 
-    // ── 收集阶段控制 ──
+    // ── 收集阶段 ──
     bool isCollecting() const  { return mCollecting.load(std::memory_order_acquire); }
     void setCollecting(bool v) { mCollecting.store(v, std::memory_order_release); }
 
@@ -85,7 +83,6 @@ public:
         mLiveActors.erase(actor);
     }
 
-    // 在 mCollectMutex 锁内调用消除 TOCTOU
     bool isActorSafeToTick(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
         return mLiveActors.count(actor) > 0;
@@ -97,8 +94,7 @@ public:
         mPendingQueue.clear();
     }
 
-    // ── 并行阶段 Level 全局变更锁 ──
-    // addEntity / removeEntity 在并行期间必须串行化
+    // ── 并行阶段 ──
     std::mutex& getLevelMutex() { return mLevelMutex; }
 
     bool isParallelPhase() const {
@@ -108,19 +104,42 @@ public:
         mParallelPhase.store(v, std::memory_order_release);
     }
 
-    // ── SEH 崩溃标记 ──
-    void markCrashed(Actor* actor) {
+    // ── 崩溃追踪（增强版）──
+    void recordCrash(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
-        mCrashedActors.insert(actor);
-        mLiveActors.erase(actor);
+        mCrashCount[actor]++;
+        if (mCrashCount[actor] >= mConfig.maxCrashCountPerActor) {
+            mCrashedActors.insert(actor);
+            mLiveActors.erase(actor);
+        }
     }
-    bool isCrashed(Actor* actor) {
+
+    bool isPermanentlyCrashed(Actor* actor) {
         std::lock_guard<std::mutex> lk(mCollectMutex);
         return mCrashedActors.count(actor) > 0;
     }
-    void clearCrashed() {
+
+    // 收集需要在主线程 kill 的崩溃实体
+    void scheduleKill(Actor* actor) {
+        std::lock_guard<std::mutex> lk(mKillMutex);
+        mPendingKills.push_back(actor);
+    }
+
+    std::vector<Actor*> takePendingKills() {
+        std::lock_guard<std::mutex> lk(mKillMutex);
+        return std::move(mPendingKills);
+    }
+
+    void clearCrashData() {
         std::lock_guard<std::mutex> lk(mCollectMutex);
-        mCrashedActors.clear();
+        // 只清除计数，永久标记保留到实体被移除
+    }
+
+    // 实体被移除时清除其崩溃记录
+    void clearCrashRecord(Actor* actor) {
+        std::lock_guard<std::mutex> lk(mCollectMutex);
+        mCrashedActors.erase(actor);
+        mCrashCount.erase(actor);
     }
 
     // ── 统计 ──
@@ -128,6 +147,8 @@ public:
         mTotalStats.fetch_add(total, std::memory_order_relaxed);
         mPhaseStats.fetch_add(phases, std::memory_order_relaxed);
     }
+
+    std::atomic<size_t>& getCrashStats() { return mCrashStats; }
 
 private:
     void startStatsTask();
@@ -148,11 +169,17 @@ private:
     std::mutex                  mLevelMutex;
 
     // 崩溃追踪
-    std::unordered_set<Actor*>  mCrashedActors;
+    std::unordered_set<Actor*>           mCrashedActors;
+    std::unordered_map<Actor*, int>      mCrashCount;
+
+    // 延迟 kill 队列（主线程消费）
+    std::mutex              mKillMutex;
+    std::vector<Actor*>     mPendingKills;
 
     // 统计
     std::atomic<size_t> mTotalStats{0};
     std::atomic<size_t> mPhaseStats{0};
+    std::atomic<size_t> mCrashStats{0};
     std::atomic<bool>   mStatsTaskRunning{false};
     std::atomic<int>    mAutoMaxEntities;
 };
