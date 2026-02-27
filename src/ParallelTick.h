@@ -5,6 +5,7 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <unordered_set>
 #include "Config.h"
 #include "FixedThreadPool.h"
 
@@ -42,10 +43,23 @@ public:
     void collectActor(Actor* actor, BlockSource& region) {
         std::lock_guard lock(mQueueMutex);
         mPendingQueue.push_back({actor, &region});
+        mLiveActors.insert(actor);
+    }
+
+    // 实体被删除时，从存活集合移除
+    void onActorRemoved(Actor* actor) {
+        std::lock_guard lock(mQueueMutex);
+        mLiveActors.erase(actor);
+    }
+
+    bool isActorAlive(Actor* actor) {
+        std::lock_guard lock(mQueueMutex);
+        return mLiveActors.count(actor) > 0;
     }
 
     std::vector<ActorTickEntry> takeQueue() {
         std::lock_guard lock(mQueueMutex);
+        mLiveActors.clear();
         return std::move(mPendingQueue);
     }
 
@@ -62,18 +76,19 @@ private:
     void startDebugTask();
     void stopDebugTask();
 
-    ll::mod::NativeMod&         mSelf;
-    Config                      mConfig;
-    std::shared_mutex           mLifecycleMutex;
-    FixedThreadPool             mPool;
+    ll::mod::NativeMod&             mSelf;
+    Config                          mConfig;
+    std::shared_mutex               mLifecycleMutex;
+    FixedThreadPool                 mPool;
 
-    std::atomic<bool>           mCollecting{false};
-    std::mutex                  mQueueMutex;
-    std::vector<ActorTickEntry> mPendingQueue;
+    std::atomic<bool>               mCollecting{false};
+    std::mutex                      mQueueMutex;
+    std::vector<ActorTickEntry>     mPendingQueue;
+    std::unordered_set<Actor*>      mLiveActors;  // 收集期间存活的 actor
 
-    std::atomic<size_t>         mPhaseStats[4] = {0, 0, 0, 0};
-    std::atomic<size_t>         mUnsafeStats   = 0;
-    std::atomic<bool>           mDebugTaskRunning{false};
+    std::atomic<size_t>             mPhaseStats[4] = {0, 0, 0, 0};
+    std::atomic<size_t>             mUnsafeStats   = 0;
+    std::atomic<bool>               mDebugTaskRunning{false};
 };
 
 } // namespace parallel_tick
