@@ -220,6 +220,14 @@ LL_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
+    // 线程局部重入保护
+    static thread_local bool inTick = false;
+    if (inTick) {
+        origin();
+        return;
+    }
+    inTick = true;
+
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto  conf = pt.getConfig();
 
@@ -232,10 +240,10 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Disabled, exit", currentTimeString());
         }
+        inTick = false;
         return;
     }
 
-    // 收集阶段
     pt.setCollecting(true);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Collecting set to true, calling origin", currentTimeString());
@@ -260,11 +268,11 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Exit (empty)", currentTimeString());
         }
+        inTick = false;
         return;
     }
 
-    // 过滤有效实体（存活检查）
-    std::vector<ActorTickEntry> valid;
+    std::vector<parallel_tick::ActorTickEntry> valid;
     valid.reserve(list.size());
     for (auto& e : list) {
         bool alive = e.actor && pt.isActorAlive(e.actor);
@@ -284,12 +292,13 @@ LL_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Exit (no valid)", currentTimeString());
         }
+        inTick = false;
         return;
     }
 
     // ============= 动态分区开始 =============
     // 1. 构建网格映射
-    std::unordered_map<GridPos, std::vector<ActorTickEntry>, GridPosHash> gridMap;
+    std::unordered_map<parallel_tick::GridPos, std::vector<parallel_tick::ActorTickEntry>, parallel_tick::GridPosHash> gridMap;
     for (auto& entry : valid) {
         auto pos = entry.actor->getPosition();
         int gx = static_cast<int>(std::floor(pos.x / conf.gridSizeBase));
@@ -301,24 +310,24 @@ LL_TYPE_INSTANCE_HOOK(
     }
 
     // 2. 标记网格是否已分配
-    std::unordered_set<GridPos, GridPosHash> visited;
-    std::vector<std::vector<ActorTickEntry>> tasks; // 每个元素是一个任务块
+    std::unordered_set<parallel_tick::GridPos, parallel_tick::GridPosHash> visited;
+    std::vector<std::vector<parallel_tick::ActorTickEntry>> tasks; // 每个元素是一个任务块
 
     for (auto& [gridPos, entries] : gridMap) {
         if (visited.count(gridPos)) continue;
 
         // BFS合并
-        std::queue<GridPos> q;
+        std::queue<parallel_tick::GridPos> q;
         q.push(gridPos);
         visited.insert(gridPos);
-        std::vector<ActorTickEntry> taskBlock;
+        std::vector<parallel_tick::ActorTickEntry> taskBlock;
         taskBlock.insert(taskBlock.end(), entries.begin(), entries.end());
 
         while (!q.empty()) {
-            GridPos cur = q.front(); q.pop();
+            parallel_tick::GridPos cur = q.front(); q.pop();
             // 检查四邻域
             for (int dx = -1; dx <= 1; dx += 2) {
-                GridPos neighbor{cur.x + dx, cur.z};
+                parallel_tick::GridPos neighbor{cur.x + dx, cur.z};
                 auto it = gridMap.find(neighbor);
                 if (it != gridMap.end() && !visited.count(neighbor)) {
                     if (taskBlock.size() + it->second.size() <= (size_t)conf.maxEntitiesPerTask) {
@@ -329,7 +338,7 @@ LL_TYPE_INSTANCE_HOOK(
                 }
             }
             for (int dz = -1; dz <= 1; dz += 2) {
-                GridPos neighbor{cur.x, cur.z + dz};
+                parallel_tick::GridPos neighbor{cur.x, cur.z + dz};
                 auto it = gridMap.find(neighbor);
                 if (it != gridMap.end() && !visited.count(neighbor)) {
                     if (taskBlock.size() + it->second.size() <= (size_t)conf.maxEntitiesPerTask) {
@@ -354,7 +363,9 @@ LL_TYPE_INSTANCE_HOOK(
     auto& pool = pt.getPool();
     for (auto& taskBlock : tasks) {
         pool.submit([&pt, conf, taskBlock = std::move(taskBlock)]() mutable {
-            // 任务块内串行tick，无锁
+            // 任务块内串行tick，持有递归锁防止实体被移除
+            std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
+
             for (auto& entry : taskBlock) {
                 if (!entry.actor || !pt.isActorAlive(entry.actor)) continue;
 
@@ -401,6 +412,8 @@ LL_TYPE_INSTANCE_HOOK(
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Exit", currentTimeString());
     }
+
+    inTick = false;
 }
 
 void parallel_tick::registerHooks() {
