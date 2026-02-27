@@ -40,30 +40,34 @@ public:
     std::shared_mutex& getLifecycleMutex() { return mLifecycleMutex; }
     FixedThreadPool&   getPool()           { return mPool; }
 
+    // 收集实体：写锁保护下将实体加入队列和存活集合
     void collectActor(Actor* actor, BlockSource& region) {
-        std::lock_guard lock(mQueueMutex);
+        std::unique_lock lock(mLifecycleMutex);
         mPendingQueue.push_back({actor, &region});
         mLiveActors.insert(actor);
     }
 
+    // 实体移除时从存活集合中删除（写锁保护）
     void onActorRemoved(Actor* actor) {
-        std::lock_guard lock(mQueueMutex);
+        std::unique_lock lock(mLifecycleMutex);
         mLiveActors.erase(actor);
     }
 
+    // 检查实体是否存活（读锁保护）
     bool isActorAlive(Actor* actor) {
-        std::lock_guard lock(mQueueMutex);
+        std::shared_lock lock(mLifecycleMutex);
         return mLiveActors.count(actor) > 0;
     }
 
+    // 清空存活集合（写锁保护）
     void clearLive() {
-        std::lock_guard lock(mQueueMutex);
+        std::unique_lock lock(mLifecycleMutex);
         mLiveActors.clear();
     }
 
-    // takeQueue 只取走队列，mLiveActors 保留到 clearLive() 调用
+    // 取出队列并清空（写锁保护）
     std::vector<ActorTickEntry> takeQueue() {
-        std::lock_guard lock(mQueueMutex);
+        std::unique_lock lock(mLifecycleMutex);
         return std::move(mPendingQueue);
     }
 
@@ -82,11 +86,12 @@ private:
 
     ll::mod::NativeMod&             mSelf;
     Config                          mConfig;
+    // 读写锁，保护 mPendingQueue 和 mLiveActors（移除 mQueueMutex）
     std::shared_mutex               mLifecycleMutex;
     FixedThreadPool                 mPool;
 
     std::atomic<bool>               mCollecting{false};
-    std::mutex                      mQueueMutex;
+    // 以下容器由 mLifecycleMutex 保护
     std::vector<ActorTickEntry>     mPendingQueue;
     std::unordered_set<Actor*>      mLiveActors;
 
