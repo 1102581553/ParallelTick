@@ -189,11 +189,11 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                         if (conf.debug) {
                             auto typeId   = (int)actor->getEntityTypeId();
                             auto entityId = actor->getRuntimeID().rawID;
-                            pt.getSelf().getLogger().debug(
+                            pt.getSelf().getLogger().info(
                                 "Ticking typeId={} id={}", typeId, entityId
                             );
                             actor->normalTick();
-                            pt.getSelf().getLogger().debug(
+                            pt.getSelf().getLogger().info(
                                 "Done    typeId={} id={}", typeId, entityId
                             );
                         } else {
@@ -214,11 +214,11 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         if (conf.debug) {
             auto typeId   = (int)actor->getEntityTypeId();
             auto entityId = actor->getRuntimeID().rawID;
-            pt.getSelf().getLogger().debug(
+            pt.getSelf().getLogger().info(
                 "Serial typeId={} id={}", typeId, entityId
             );
             actor->normalTick();
-            pt.getSelf().getLogger().debug(
+            pt.getSelf().getLogger().info(
                 "Serial Done typeId={} id={}", typeId, entityId
             );
         } else {
