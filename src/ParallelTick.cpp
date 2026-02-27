@@ -13,6 +13,7 @@
 #include <mc/legacy/ActorRuntimeID.h>
 #include <mc/world/level/dimension/Dimension.h>
 
+#include <windows.h>
 #include <cmath>
 #include <vector>
 #include <chrono>
@@ -20,11 +21,30 @@
 #include <sstream>
 #include <queue>
 #include <unordered_map>
+#include <cstdio>
 
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext> (Level::*)(::Actor&);
 using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntityRef);
 
+// ----------------------------------------------------------------
+// SEH 安全 tick
+// 必须是独立的非内联函数，内部不能有任何 C++ 对象析构
+// 返回 0 表示成功，非 0 为 SEH 异常码
+// ----------------------------------------------------------------
+static int tickActorSafe(Actor* actor, BlockSource& region) {
+    __try {
+        actor->tick(region);
+        return 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+}
+
 namespace parallel_tick {
+
+// ----------------------------------------------------------------
+// 工具函数
+// ----------------------------------------------------------------
 
 static std::string currentTimeString() {
     auto now       = std::chrono::system_clock::now();
@@ -35,6 +55,19 @@ static std::string currentTimeString() {
     ss << std::put_time(&tm, "%H:%M:%S");
     return ss.str();
 }
+
+static Actor* tryGetActorFromWeakRef(WeakEntityRef const& ref) {
+    if (auto stackRef = ref.lock()) {
+        if (EntityContext* ctx = stackRef.operator->()) {
+            return Actor::tryGetFromEntity(*ctx, false);
+        }
+    }
+    return nullptr;
+}
+
+// ----------------------------------------------------------------
+// 单例
+// ----------------------------------------------------------------
 
 ParallelTick& ParallelTick::getInstance() {
     static ParallelTick instance;
@@ -66,7 +99,9 @@ void ParallelTick::startStatsTask() {
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
-void ParallelTick::stopStatsTask() { mStatsTaskRunning.store(false); }
+void ParallelTick::stopStatsTask() {
+    mStatsTaskRunning.store(false);
+}
 
 // ----------------------------------------------------------------
 // 生命周期
@@ -82,9 +117,10 @@ bool ParallelTick::load() {
     getSelf().getLogger().info(
         "[{}][ParallelTick::load] enabled={}, debug={}, stats={}, "
         "threadCount={}, maxEntities={}, gridBase={}, autoAdjust={}, targetMs={}",
-        currentTimeString(), mConfig.enabled, mConfig.debug, mConfig.stats,
-        mConfig.threadCount, mConfig.maxEntitiesPerTask, mConfig.gridSizeBase,
-        mConfig.autoAdjust, mConfig.targetTickMs
+        currentTimeString(),
+        mConfig.enabled, mConfig.debug, mConfig.stats,
+        mConfig.threadCount, mConfig.maxEntitiesPerTask,
+        mConfig.gridSizeBase, mConfig.autoAdjust, mConfig.targetTickMs
     );
     return true;
 }
@@ -94,9 +130,14 @@ bool ParallelTick::enable() {
     if (threadCount <= 0)
         threadCount = std::max(1u, std::thread::hardware_concurrency() - 1);
 
-    mPool = std::make_unique<FixedThreadPool>(threadCount, 8 * 1024 * 1024);
+    // 8MB 栈，防止深调用栈溢出
+    mPool = std::make_unique<FixedThreadPool>(
+        static_cast<size_t>(threadCount),
+        8 * 1024 * 1024
+    );
 
     registerHooks();
+
     getSelf().getLogger().info(
         "[{}][ParallelTick::enable] Hooks registered, threads={}, stack=8MB",
         currentTimeString(), threadCount
@@ -112,14 +153,17 @@ bool ParallelTick::disable() {
     unregisterHooks();
     stopStatsTask();
     mPool.reset();
-    getSelf().getLogger().info("[{}][ParallelTick::disable] Done", currentTimeString());
+    getSelf().getLogger().info(
+        "[{}][ParallelTick::disable] Done",
+        currentTimeString()
+    );
     return true;
 }
 
 // ----------------------------------------------------------------
-// removeEntity Hook
-// 并行 tick 期间：挂起移除，等 waitAll 后统一清理
-// 非 tick 期间：直接放行
+// removeEntity Hook（两个重载）
+// 并行 tick 期间只挂起，非 tick 期间直接移除
+// MCBE 的内存释放照常发生，我们只维护指针集合
 // ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
@@ -140,21 +184,8 @@ LL_TYPE_INSTANCE_HOOK(
         );
     }
 
-    // 无论如何都通知 ParallelTick
-    // onActorRemoved 内部会根据 mTickingNow 决定是挂起还是立即移除
     pt.onActorRemoved(&actor);
-
-    // 让 MCBE 正常执行移除（内存释放）
     return origin(actor);
-}
-
-static Actor* tryGetActorFromWeakRef(WeakEntityRef const& ref) {
-    if (auto stackRef = ref.lock()) {
-        if (EntityContext* ctx = stackRef.operator->()) {
-            return Actor::tryGetFromEntity(*ctx, false);
-        }
-    }
-    return nullptr;
 }
 
 LL_TYPE_INSTANCE_HOOK(
@@ -183,6 +214,7 @@ LL_TYPE_INSTANCE_HOOK(
 
 // ----------------------------------------------------------------
 // Actor::tick 拦截 Hook
+// 玩家和模拟玩家走原始 tick，其余实体收集入队
 // ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
@@ -199,7 +231,6 @@ LL_TYPE_INSTANCE_HOOK(
     if (!conf.enabled || !pt.isCollecting())
         return origin(region);
 
-    // 玩家和模拟玩家不拦截
     if (this->isPlayer() || this->isSimulatedPlayer())
         return origin(region);
 
@@ -230,7 +261,8 @@ LL_TYPE_INSTANCE_HOOK(
     inTick = true;
 
     auto& pt   = parallel_tick::ParallelTick::getInstance();
-    auto  conf = pt.getConfig();
+    auto  conf = pt.getConfig();   // 按值拷贝，线程安全
+
     auto tickStart = std::chrono::steady_clock::now();
 
     if (!conf.enabled) {
@@ -241,7 +273,7 @@ LL_TYPE_INSTANCE_HOOK(
 
     // ── 阶段1：收集 ──────────────────────────────────────────────
     pt.setCollecting(true);
-    origin();
+    origin();   // 触发所有 Actor::tick Hook，收集入队
     pt.setCollecting(false);
 
     auto list = pt.takeQueue();
@@ -252,8 +284,8 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段2：主线程建立快照（持锁，工作线程不查询存活）─────────
-    // 同时检测在 origin() 执行期间（收集阶段）被移除的实体
+    // ── 阶段2：主线程建立快照（持锁过滤）────────────────────────
+    // 过滤掉在收集阶段已经被移除的实体
     std::vector<ActorTickEntry> snapshot;
     snapshot.reserve(list.size());
     {
@@ -278,20 +310,31 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // ── 阶段3：标记进入并行 tick，此后 removeEntity 只挂起不立即改 liveActors ──
+    // ── 阶段3：标记进入并行 tick ──────────────────────────────────
+    // 此后 removeEntity Hook 只写 mPendingRemove，不动 mLiveActors
     pt.setTickingNow(true);
 
     // ── 阶段4：按 BlockSource 分组 ──────────────────────────────
+    // 同一 BlockSource 内串行，不同 BlockSource 之间并行
     std::unordered_map<BlockSource*, std::vector<ActorTickEntry>> bsMap;
     for (auto& entry : snapshot) {
         bsMap[entry.region].push_back(entry);
     }
 
+    if (conf.debug) {
+        pt.getSelf().getLogger().info(
+            "[{}][ParallelTick] BlockSource groups={}",
+            currentTimeString(), bsMap.size()
+        );
+    }
+
     // ── 阶段5：组内网格分区 + BFS 合并 ──────────────────────────
-    int currentMax = conf.autoAdjust ? pt.getAutoMaxEntities() : conf.maxEntitiesPerTask;
+    int currentMax = conf.autoAdjust
+                   ? pt.getAutoMaxEntities()
+                   : conf.maxEntitiesPerTask;
 
     struct Task {
-        BlockSource*               bs;
+        BlockSource*                bs;
         std::vector<ActorTickEntry> entries;
     };
     std::vector<Task> taskList;
@@ -325,8 +368,10 @@ LL_TYPE_INSTANCE_HOOK(
                 for (auto& nb : neighbors) {
                     auto it = gridMap.find(nb);
                     if (it != gridMap.end() && !visited.count(nb)) {
-                        if (block.size() + it->second.size() <= (size_t)currentMax) {
-                            block.insert(block.end(), it->second.begin(), it->second.end());
+                        if (block.size() + it->second.size()
+                                <= static_cast<size_t>(currentMax)) {
+                            block.insert(block.end(),
+                                         it->second.begin(), it->second.end());
                             visited.insert(nb);
                             q.push(nb);
                         }
@@ -341,24 +386,23 @@ LL_TYPE_INSTANCE_HOOK(
 
     if (conf.debug) {
         pt.getSelf().getLogger().info(
-            "[{}][ParallelTick] {} tasks from {} entities, {} BlockSources",
+            "[{}][ParallelTick] Submitting {} tasks, {} entities, {} BlockSources",
             currentTimeString(), taskList.size(), snapshot.size(), bsMap.size()
         );
     }
 
     // ── 阶段6：提交线程池 ────────────────────────────────────────
     // 工作线程不持任何全局锁
-    // 每个任务对应一个 BlockSource，内部串行 tick，不同 BlockSource 并行
+    // tickActorSafe 用 SEH 捕获硬件异常，工作线程不崩溃
     auto& pool = pt.getPool();
 
     for (auto& task : taskList) {
         pool.submit([&pt, conf, task = std::move(task)]() mutable {
-
             for (auto& entry : task.entries) {
                 if (!entry.actor) continue;
 
-                // 在 tick 前通过 isInWorld 做最后一道校验
-                // isInWorld 只读内部标志位，不涉及锁，相对安全
+                // isInWorld 作为轻量级二次过滤
+                // 捕获快照建立之后、tick 执行之前被移除的实体
                 if (!entry.actor->isInWorld()) {
                     if (conf.debug) {
                         pt.getSelf().getLogger().info(
@@ -369,25 +413,36 @@ LL_TYPE_INSTANCE_HOOK(
                     continue;
                 }
 
-                auto typeId   = (int)entry.actor->getEntityTypeId();
-                auto entityId = entry.actor->getRuntimeID().rawID;
-                auto pos      = entry.actor->getPosition();
-                auto dimId    = entry.actor->getDimensionId();
-
                 if (conf.debug) {
                     pt.getSelf().getLogger().info(
-                        "[{}][ParallelTick][Task] Tick typeId={}, id={}, actor={:p}",
-                        currentTimeString(), typeId, entityId, (void*)entry.actor
+                        "[{}][ParallelTick][Task] Tick actor={:p}, typeId={}, id={}",
+                        currentTimeString(),
+                        (void*)entry.actor,
+                        (int)entry.actor->getEntityTypeId(),
+                        entry.actor->getRuntimeID().rawID
                     );
                 }
 
-                // 异常由 FixedThreadPool 的包装层捕获，不会传出，工作线程不会崩溃
-                entry.actor->tick(*entry.region);
+                // SEH 安全调用：捕获空指针、非法内存访问等硬件异常
+                // 使用收集时保存的原始 region，不重新获取
+                int exCode = tickActorSafe(entry.actor, *entry.region);
 
-                if (conf.debug) {
+                if (exCode != 0) {
+                    fprintf(stderr,
+                        "[ParallelTick][Task] SEH 0x%08X on actor=%p, skipped\n",
+                        static_cast<unsigned>(exCode),
+                        static_cast<void*>(entry.actor));
+                    if (conf.debug) {
+                        pt.getSelf().getLogger().warn(
+                            "[ParallelTick][Task] SEH 0x{:08X} actor={:p} skipped",
+                            static_cast<unsigned>(exCode),
+                            (void*)entry.actor
+                        );
+                    }
+                } else if (conf.debug) {
                     pt.getSelf().getLogger().info(
-                        "[{}][ParallelTick][Task] Done typeId={}, id={}",
-                        currentTimeString(), typeId, entityId
+                        "[{}][ParallelTick][Task] Done actor={:p}",
+                        currentTimeString(), (void*)entry.actor
                     );
                 }
             }
@@ -397,14 +452,15 @@ LL_TYPE_INSTANCE_HOOK(
     // ── 阶段7：等待所有任务完成 ──────────────────────────────────
     pool.waitAll();
 
-    // ── 阶段8：退出并行 tick 状态，清理挂起的移除请求 ────────────
+    // ── 阶段8：退出并行 tick，统一清理挂起的移除请求 ─────────────
     pt.setTickingNow(false);
-    pt.flushPendingRemove();    // 统一处理 tick 期间产生的 removeEntity
+    pt.flushPendingRemove();
     pt.clearLive();
 
-    // ── 阶段9：自动调整 ──────────────────────────────────────────
+    // ── 阶段9：自动调整 maxEntitiesPerTask ───────────────────────
     auto tickEnd = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(tickEnd - tickStart).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       tickEnd - tickStart).count();
 
     if (conf.autoAdjust && conf.enabled) {
         int oldVal = pt.getAutoMaxEntities();
@@ -423,6 +479,11 @@ LL_TYPE_INSTANCE_HOOK(
                     currentTimeString(), oldVal, newVal, elapsed
                 );
             }
+        } else if (conf.debug) {
+            pt.getSelf().getLogger().info(
+                "[{}][AutoAdjust] No change ({}ms)",
+                currentTimeString(), elapsed
+            );
         }
     }
 
@@ -437,15 +498,17 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ----------------------------------------------------------------
+// Hook 注册 / 注销
+// ----------------------------------------------------------------
 
-void parallel_tick::registerHooks() {
+void registerHooks() {
     ParallelRemoveActorLock::hook();
     ParallelRemoveWeakRefLock::hook();
     ParallelActorTickHook::hook();
     ParallelLevelTickHook::hook();
 }
 
-void parallel_tick::unregisterHooks() {
+void unregisterHooks() {
     ParallelRemoveActorLock::unhook();
     ParallelRemoveWeakRefLock::unhook();
     ParallelActorTickHook::unhook();
