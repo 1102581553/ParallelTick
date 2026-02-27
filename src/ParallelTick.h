@@ -13,15 +13,8 @@ class ActorUniqueID;
 
 namespace parallel_tick {
 
-// 引入配置（已在 Config.h 定义）
 struct Config;
-
-// 统计结构
-struct Stats {
-    std::atomic<size_t> totalMobsParalleled{0};
-    std::atomic<size_t> totalBatches{0};
-    std::atomic<size_t> crashedActors{0};
-};
+struct Stats;
 
 // 线程池接口
 class ThreadPool {
@@ -44,14 +37,14 @@ class ParallelTick {
 public:
     static ParallelTick& getInstance();
 
-    // 插件生命周期
-    bool load(ll::plugin::NativePlugin& self);
+    // 插件生命周期（使用 ll::mod::NativeMod）
+    bool load(ll::mod::NativeMod& self);
     bool unload();
 
     // 访问器
-    ll::plugin::NativePlugin& getSelf();
-    const Config&             getConfig() const;
-    ThreadPool&               getPool();
+    ll::mod::NativeMod& getSelf();
+    const Config&       getConfig() const;
+    ThreadPool&         getPool();
 
     // 实体安全检查（基于黑名单）
     bool isActorSafeToTick(Actor* a) const;
