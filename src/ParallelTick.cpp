@@ -46,7 +46,7 @@ void ParallelTick::startStatsTask() {
             co_await std::chrono::seconds(5);
             ll::thread::ServerThreadExecutor::getDefault().execute([this] {
                 bool outputStats = mConfig.stats;
-                if (!outputStats) return;  // 仅当 stats 开启时输出
+                if (!outputStats) return;
 
                 size_t p0 = mPhaseStats[0].exchange(0);
                 size_t p1 = mPhaseStats[1].exchange(0);
@@ -360,6 +360,9 @@ LL_TYPE_INSTANCE_HOOK(
 
                     auto typeId   = (int)entry.actor->getEntityTypeId();
                     auto entityId = entry.actor->getRuntimeID().rawID;
+                    auto pos      = entry.actor->getPosition();
+                    auto dimId    = entry.actor->getDimensionId();
+
                     if (conf.debug) {
                         pt.getSelf().getLogger().info(
                             "[{}][ParallelTick][Task] Starting tick: typeId={}, id={}, actor={:p}, region={:p}",
@@ -377,16 +380,16 @@ LL_TYPE_INSTANCE_HOOK(
                         }
                     } catch (const std::exception& e) {
                         pt.getSelf().getLogger().error(
-                            "[{}][ParallelTick][Task] Exception during tick: typeId={}, id={}, what={}",
-                            currentTimeString(), typeId, entityId, e.what()
+                            "[{}][ParallelTick][Task] Exception during tick: typeId={}, id={}, what={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
+                            currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, dimId
                         );
-                        throw;
+                        // 跳过此实体，继续处理下一个
                     } catch (...) {
                         pt.getSelf().getLogger().error(
-                            "[{}][ParallelTick][Task] Unknown exception during tick: typeId={}, id={}",
-                            currentTimeString(), typeId, entityId
+                            "[{}][ParallelTick][Task] Unknown exception during tick: typeId={}, id={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
+                            currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, dimId
                         );
-                        throw;
+                        // 跳过此实体，继续处理下一个
                     }
                 }
                 if (conf.debug) {
