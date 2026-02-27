@@ -123,7 +123,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
 
-    // 临时：无条件打印，确认 hook 是否生效
     pt.getSelf().getLogger().info(
         "NormalTick hook hit, collecting={}, isPlayer={}",
         pt.isCollecting(), this->isPlayer()
@@ -153,6 +152,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto  conf = pt.getConfig();
+
+    pt.getSelf().getLogger().info("tickEntities called"); // 临时
 
     if (!conf.enabled) {
         origin();
