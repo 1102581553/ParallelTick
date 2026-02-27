@@ -18,6 +18,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <queue>
 
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext> (Level::*)(::Actor&);
 using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntityRef);
@@ -45,20 +46,16 @@ void ParallelTick::startStatsTask() {
         while (mStatsTaskRunning.load()) {
             co_await std::chrono::seconds(5);
             ll::thread::ServerThreadExecutor::getDefault().execute([this] {
-                bool outputStats = mConfig.stats;
-                if (!outputStats) return;
+                if (!mConfig.stats) return;
 
-                size_t p0 = mPhaseStats[0].exchange(0);
-                size_t p1 = mPhaseStats[1].exchange(0);
-                size_t p2 = mPhaseStats[2].exchange(0);
-                size_t p3 = mPhaseStats[3].exchange(0);
-                size_t u  = mUnsafeStats.exchange(0);
-                size_t total = p0 + p1 + p2 + p3 + u;
+                size_t total = mTotalStats.exchange(0);
+                size_t parallel = mParallelStats.exchange(0);
+                size_t serial = mSerialStats.exchange(0);
 
                 if (total > 0) {
                     getSelf().getLogger().info(
-                        "[{}][ParallelStats] Total={}, Parallel={}({}/{}/{}/{}), Serial={}",
-                        currentTimeString(), total, (p0+p1+p2+p3), p0, p1, p2, p3, u
+                        "[{}][ParallelStats] Total={}, Parallel={}, Serial={}",
+                        currentTimeString(), total, parallel, serial
                     );
                 }
             });
@@ -72,8 +69,9 @@ bool ParallelTick::load() {
     auto path = getSelf().getConfigDir() / "config.json";
     if (!ll::config::loadConfig(mConfig, path))
         ll::config::saveConfig(mConfig, path);
-    getSelf().getLogger().info("[{}][ParallelTick::load] Config loaded, enabled={}, debug={}, stats={}, threadCount={}",
-                               currentTimeString(), mConfig.enabled, mConfig.debug, mConfig.stats, mConfig.threadCount);
+    getSelf().getLogger().info("[{}][ParallelTick::load] Config loaded, enabled={}, debug={}, stats={}, threadCount={}, maxEntities={}, gridBase={}",
+                               currentTimeString(), mConfig.enabled, mConfig.debug, mConfig.stats, mConfig.threadCount,
+                               mConfig.maxEntitiesPerTask, mConfig.gridSizeBase);
     return true;
 }
 
@@ -103,7 +101,7 @@ bool ParallelTick::disable() {
 }
 
 // ----------------------------------------------------------------
-// Hooks
+// 移除锁 Hook
 // ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
@@ -168,6 +166,10 @@ LL_TYPE_INSTANCE_HOOK(
     return result;
 }
 
+// ----------------------------------------------------------------
+// Actor::tick 拦截 Hook
+// ----------------------------------------------------------------
+
 LL_TYPE_INSTANCE_HOOK(
     ParallelActorTickHook,
     ll::memory::HookPriority::Normal,
@@ -207,6 +209,10 @@ LL_TYPE_INSTANCE_HOOK(
     return true;
 }
 
+// ----------------------------------------------------------------
+// Level::$tick 外层 Hook — 动态分区并行
+// ----------------------------------------------------------------
+
 LL_TYPE_INSTANCE_HOOK(
     ParallelLevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -229,6 +235,7 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
+    // 收集阶段
     pt.setCollecting(true);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Collecting set to true, calling origin", currentTimeString());
@@ -256,7 +263,8 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    std::vector<parallel_tick::ActorTickEntry> valid;
+    // 过滤有效实体（存活检查）
+    std::vector<ActorTickEntry> valid;
     valid.reserve(list.size());
     for (auto& e : list) {
         bool alive = e.actor && pt.isActorAlive(e.actor);
@@ -279,137 +287,116 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    if (conf.debug) {
-        pt.getSelf().getLogger().info("[{}][ParallelTick] Valid actors after filtering: {}", currentTimeString(), valid.size());
-    }
-
-    struct Groups {
-        std::vector<parallel_tick::ActorTickEntry> phase[4];
-    } groups;
-
+    // ============= 动态分区开始 =============
+    // 1. 构建网格映射
+    std::unordered_map<GridPos, std::vector<ActorTickEntry>, GridPosHash> gridMap;
     for (auto& entry : valid) {
-        auto const& pos = entry.actor->getPosition();
-        int gx    = static_cast<int>(std::floor(pos.x / conf.gridSize));
-        int gz    = static_cast<int>(std::floor(pos.z / conf.gridSize));
-        int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
-        groups.phase[color].push_back(entry);
+        auto pos = entry.actor->getPosition();
+        int gx = static_cast<int>(std::floor(pos.x / conf.gridSizeBase));
+        int gz = static_cast<int>(std::floor(pos.z / conf.gridSizeBase));
+        gridMap[{gx, gz}].push_back(entry);
         if (conf.debug) {
-            pt.getSelf().getLogger().info("[{}][ParallelTick] Grouping: actor={:p}, pos=({},{},{}) -> color={}", 
-                                          currentTimeString(), (void*)entry.actor, pos.x, pos.y, pos.z, color);
+            pt.getSelf().getLogger().info("[{}][ParallelTick] Grid assign: actor={:p} -> ({},{})", currentTimeString(), (void*)entry.actor, gx, gz);
         }
     }
 
-    pt.addStats(
-        (int)groups.phase[0].size(), (int)groups.phase[1].size(),
-        (int)groups.phase[2].size(), (int)groups.phase[3].size(), 0
-    );
+    // 2. 标记网格是否已分配
+    std::unordered_set<GridPos, GridPosHash> visited;
+    std::vector<std::vector<ActorTickEntry>> tasks; // 每个元素是一个任务块
+
+    for (auto& [gridPos, entries] : gridMap) {
+        if (visited.count(gridPos)) continue;
+
+        // BFS合并
+        std::queue<GridPos> q;
+        q.push(gridPos);
+        visited.insert(gridPos);
+        std::vector<ActorTickEntry> taskBlock;
+        taskBlock.insert(taskBlock.end(), entries.begin(), entries.end());
+
+        while (!q.empty()) {
+            GridPos cur = q.front(); q.pop();
+            // 检查四邻域
+            for (int dx = -1; dx <= 1; dx += 2) {
+                GridPos neighbor{cur.x + dx, cur.z};
+                auto it = gridMap.find(neighbor);
+                if (it != gridMap.end() && !visited.count(neighbor)) {
+                    if (taskBlock.size() + it->second.size() <= (size_t)conf.maxEntitiesPerTask) {
+                        taskBlock.insert(taskBlock.end(), it->second.begin(), it->second.end());
+                        visited.insert(neighbor);
+                        q.push(neighbor);
+                    }
+                }
+            }
+            for (int dz = -1; dz <= 1; dz += 2) {
+                GridPos neighbor{cur.x, cur.z + dz};
+                auto it = gridMap.find(neighbor);
+                if (it != gridMap.end() && !visited.count(neighbor)) {
+                    if (taskBlock.size() + it->second.size() <= (size_t)conf.maxEntitiesPerTask) {
+                        taskBlock.insert(taskBlock.end(), it->second.begin(), it->second.end());
+                        visited.insert(neighbor);
+                        q.push(neighbor);
+                    }
+                }
+            }
+        }
+        tasks.push_back(std::move(taskBlock));
+    }
+
+    // 3. 统计
+    pt.addStats(valid.size(), tasks.size(), 0);
+
     if (conf.debug) {
-        pt.getSelf().getLogger().info("[{}][ParallelTick] Phase sizes: {} {} {} {}", 
-                                      currentTimeString(), groups.phase[0].size(), groups.phase[1].size(), groups.phase[2].size(), groups.phase[3].size());
+        pt.getSelf().getLogger().info("[{}][ParallelTick] Generated {} tasks from {} entities", currentTimeString(), tasks.size(), valid.size());
     }
 
+    // 4. 提交任务
     auto& pool = pt.getPool();
+    for (auto& taskBlock : tasks) {
+        pool.submit([&pt, conf, taskBlock = std::move(taskBlock)]() mutable {
+            // 任务块内串行tick，无锁
+            for (auto& entry : taskBlock) {
+                if (!entry.actor || !pt.isActorAlive(entry.actor)) continue;
 
-    for (int p = 0; p < 4; ++p) {
-        auto& phaseList = groups.phase[p];
-        if (phaseList.empty()) {
-            if (conf.debug) {
-                pt.getSelf().getLogger().info("[{}][ParallelTick] Phase {} empty, skipping", currentTimeString(), p);
-            }
-            continue;
-        }
+                BlockSource& region = entry.actor->getDimension().getBlockSourceFromMainChunkSource();
+                auto typeId   = (int)entry.actor->getEntityTypeId();
+                auto entityId = entry.actor->getRuntimeID().rawID;
+                auto pos      = entry.actor->getPosition();
+                auto dimId    = entry.actor->getDimensionId();
 
-        if (conf.debug) {
-            pt.getSelf().getLogger().info("[{}][ParallelTick] Processing phase {} with {} actors", currentTimeString(), p, phaseList.size());
-        }
-
-        for (size_t i = 0; i < phaseList.size(); i += (size_t)conf.batchSize) {
-            size_t end        = std::min(i + (size_t)conf.batchSize, phaseList.size());
-            auto*  batchBegin = phaseList.data() + i;
-            size_t batchCount = end - i;
-
-            if (conf.debug) {
-                pt.getSelf().getLogger().info("[{}][ParallelTick] Submitting batch: phase={}, index={}-{}, count={}", 
-                                              currentTimeString(), p, i, end-1, batchCount);
-            }
-
-            pool.submit([&pt, conf, batchBegin, batchCount, p, i] {
-                std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());  // 独占锁
                 if (conf.debug) {
-                    pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Batch started: phase={}, index={}, count={}", 
-                                                  currentTimeString(), p, i, batchCount);
+                    pt.getSelf().getLogger().info(
+                        "[{}][ParallelTick][Task] Starting tick: typeId={}, id={}, actor={:p}, region={:p}",
+                        currentTimeString(), typeId, entityId, (void*)entry.actor, (void*)&region
+                    );
                 }
 
-                for (size_t j = 0; j < batchCount; ++j) {
-                    auto& entry = batchBegin[j];
-                    if (!entry.actor) {
-                        if (conf.debug) {
-                            pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Skipping null actor in batch", currentTimeString());
-                        }
-                        continue;
-                    }
-
-                    bool alive = pt.isActorAlive(entry.actor);
-                    if (conf.debug) {
-                        pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Before tick: actor={:p}, alive={}", 
-                                                      currentTimeString(), (void*)entry.actor, alive);
-                    }
-                    if (!alive) continue;
-
-                    BlockSource& region = entry.actor->getDimension().getBlockSourceFromMainChunkSource();
-
-                    auto typeId   = (int)entry.actor->getEntityTypeId();
-                    auto entityId = entry.actor->getRuntimeID().rawID;
-                    auto pos      = entry.actor->getPosition();
-                    auto dimId    = entry.actor->getDimensionId();
-
+                try {
+                    entry.actor->tick(region);
                     if (conf.debug) {
                         pt.getSelf().getLogger().info(
-                            "[{}][ParallelTick][Task] Starting tick: typeId={}, id={}, actor={:p}, region={:p}",
-                            currentTimeString(), typeId, entityId, (void*)entry.actor, (void*)&region
+                            "[{}][ParallelTick][Task] Finished tick: typeId={}, id={}",
+                            currentTimeString(), typeId, entityId
                         );
                     }
-
-                    try {
-                        entry.actor->tick(region);
-                        if (conf.debug) {
-                            pt.getSelf().getLogger().info(
-                                "[{}][ParallelTick][Task] Finished tick: typeId={}, id={}",
-                                currentTimeString(), typeId, entityId
-                            );
-                        }
-                    } catch (const std::exception& e) {
-                        pt.getSelf().getLogger().error(
-                            "[{}][ParallelTick][Task] Exception during tick: typeId={}, id={}, what={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
-                            currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, (int)dimId
-                        );
-                        // 跳过此实体，继续处理下一个
-                    } catch (...) {
-                        pt.getSelf().getLogger().error(
-                            "[{}][ParallelTick][Task] Unknown exception during tick: typeId={}, id={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
-                            currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, (int)dimId
-                        );
-                        // 跳过此实体，继续处理下一个
-                    }
+                } catch (const std::exception& e) {
+                    pt.getSelf().getLogger().error(
+                        "[{}][ParallelTick][Task] Exception during tick: typeId={}, id={}, what={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
+                        currentTimeString(), typeId, entityId, e.what(), pos.x, pos.y, pos.z, (int)dimId
+                    );
+                } catch (...) {
+                    pt.getSelf().getLogger().error(
+                        "[{}][ParallelTick][Task] Unknown exception during tick: typeId={}, id={}, pos=({:.2f},{:.2f},{:.2f}), dim={}",
+                        currentTimeString(), typeId, entityId, pos.x, pos.y, pos.z, (int)dimId
+                    );
                 }
-                if (conf.debug) {
-                    pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Batch finished: phase={}, index={}", currentTimeString(), p, i);
-                }
-            });
-        }
-
-        if (conf.debug) {
-            pt.getSelf().getLogger().info("[{}][ParallelTick] Waiting for phase {} tasks to complete", currentTimeString(), p);
-        }
-        pool.waitAll();
-        if (conf.debug) {
-            pt.getSelf().getLogger().info("[{}][ParallelTick] Phase {} completed", currentTimeString(), p);
-        }
+            }
+        });
     }
 
-    if (conf.debug) {
-        pt.getSelf().getLogger().info("[{}][ParallelTick] All phases done, clearing live", currentTimeString());
-    }
+    // 5. 等待所有任务完成
+    pool.waitAll();
+
     pt.clearLive();
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelLevelTickHook] Exit", currentTimeString());
