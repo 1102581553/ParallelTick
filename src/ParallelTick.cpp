@@ -13,6 +13,8 @@
 #include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
 
+#include <mc/legacy/ActorRuntimeID.h>
+
 #include <cmath>
 #include <thread>
 #include <vector>
