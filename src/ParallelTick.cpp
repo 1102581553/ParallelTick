@@ -104,12 +104,9 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // 辅助函数：从 WeakEntityRef 获取 Actor 指针
-// 利用 WeakEntityRef::lock() 返回 StackRefResult<EntityContext>
 static Actor* tryGetActorFromWeakRef(WeakEntityRef const& ref) {
     if (auto stackRef = ref.lock()) {
-        // StackRefResult 提供 operator->() 返回 EntityContext*
         if (EntityContext* ctx = stackRef.operator->()) {
-            // Actor::tryGetFromEntity 第二个参数 false 表示不包含已移除的实体
             return Actor::tryGetFromEntity(*ctx, false);
         }
     }
@@ -125,11 +122,9 @@ LL_TYPE_INSTANCE_HOOK(
     ::WeakEntityRef entityRef
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
-    // 尝试获取 Actor 指针并清理 mLiveActors
     if (Actor* actor = tryGetActorFromWeakRef(entityRef)) {
         pt.onActorRemoved(actor);
     }
-    // 写锁保护原始移除操作
     std::unique_lock lock(pt.getLifecycleMutex());
     return origin(std::move(entityRef));
 }
@@ -180,24 +175,22 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 开启收集窗口，执行原始 tick（Actor::tick hook 在此期间收集实体）
     pt.setCollecting(true);
     origin();
     pt.setCollecting(false);
 
-    // 取走队列（写锁），mLiveActors 此时仍有效
-    auto list = pt.takeQueue();
+    auto list = pt.takeQueue();  // 写锁取出队列，释放锁
 
     if (conf.debug) {
         pt.getSelf().getLogger().info("Queue size: {}", list.size());
     }
 
     if (list.empty()) {
-        pt.clearLive();  // 写锁清空
+        pt.clearLive();  // 写锁
         return;
     }
 
-    // 过滤掉在 origin() 执行期间被删除的 actor（使用读锁检查）
+    // 过滤：使用读锁检查存活
     std::vector<parallel_tick::ActorTickEntry> valid;
     valid.reserve(list.size());
     for (auto& e : list) {
@@ -211,7 +204,7 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 四色棋盘分组，同组内实体空间上不相邻，可安全并行
+    // 四色分组
     struct Groups {
         std::vector<parallel_tick::ActorTickEntry> phase[4];
     } groups;
@@ -243,36 +236,46 @@ LL_TYPE_INSTANCE_HOOK(
             size_t batchCount = end - i;
 
             pool.submit([&pt, conf, batchBegin, batchCount] {
-                // 在任务开始时获取读锁，确保在 tick 期间实体不会被移除
+                // 任务开始时获取读锁，确保在 tick 期间实体不会被移除
                 std::shared_lock lock(pt.getLifecycleMutex());
+
                 for (size_t j = 0; j < batchCount; ++j) {
                     auto& entry = batchBegin[j];
-                    // 执行前再次确认 actor 仍然存活（此时已在读锁内）
                     if (!entry.actor || !pt.isActorAlive(entry.actor)) continue;
 
+                    // 动态获取当前有效的 BlockSource，避免使用存储的指针
+                    BlockSource& region = entry.actor->getDimension().getBlockSource();
+
+                    // 记录详细日志（即使 debug 为 false 也记录崩溃前信息）
+                    auto typeId   = (int)entry.actor->getEntityTypeId();
+                    auto entityId = entry.actor->getRuntimeID().rawID;
+                    pt.getSelf().getLogger().info(
+                        "[ParallelTick] Starting tick: typeId={}, id={}", typeId, entityId
+                    );
+
+                    // 执行 tick，并捕获可能的异常（记录后重新抛出）
+                    try {
+                        entry.actor->tick(region);
+                    } catch (...) {
+                        pt.getSelf().getLogger().error(
+                            "[ParallelTick] Exception during tick: typeId={}, id={}", typeId, entityId
+                        );
+                        throw; // 重新抛出以触发崩溃，便于调试
+                    }
+
                     if (conf.debug) {
-                        auto typeId   = (int)entry.actor->getEntityTypeId();
-                        auto entityId = entry.actor->getRuntimeID().rawID;
                         pt.getSelf().getLogger().info(
-                            "Ticking typeId={} id={}", typeId, entityId
+                            "[ParallelTick] Finished tick: typeId={}, id={}", typeId, entityId
                         );
-                        entry.actor->tick(*entry.region);
-                        pt.getSelf().getLogger().info(
-                            "Done    typeId={} id={}", typeId, entityId
-                        );
-                    } else {
-                        entry.actor->tick(*entry.region);
                     }
                 }
             });
         }
 
-        // 等待本 phase 所有批次完成再进入下一 phase
         pool.waitAll();
     }
 
-    // 全部 phase 执行完毕，清空存活集合
-    pt.clearLive();
+    pt.clearLive();  // 写锁清空存活集合
 }
 
 // ----------------------------------------------------------------
