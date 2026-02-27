@@ -27,7 +27,6 @@ struct GridPos {
 
 struct GridPosHash {
     std::size_t operator()(const GridPos& p) const {
-        // 使用更优的哈希组合，减少碰撞
         size_t hx = std::hash<int>()(p.x) * 2654435761u;
         size_t hz = std::hash<int>()(p.z) * 2246822519u;
         return hx ^ (hz << 1);
@@ -44,7 +43,8 @@ public:
     ParallelTick()
     : mSelf(*ll::mod::NativeMod::current()),
       mPool(nullptr),
-      mAutoMaxEntities(256) {}
+      mAutoMaxEntities(256),
+      mTickingNow(false) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
@@ -56,7 +56,6 @@ public:
     std::recursive_mutex& getLifecycleMutex() { return mLifecycleMutex; }
     FixedThreadPool&      getPool()           { return *mPool; }
 
-    // 自动调整参数访问
     int  getAutoMaxEntities() const  { return mAutoMaxEntities.load(); }
     void setAutoMaxEntities(int val) { mAutoMaxEntities.store(val); }
 
@@ -67,13 +66,21 @@ public:
         mLiveActors.insert(actor);
     }
 
-    // 延迟移除：打标记，不立即从 mLiveActors 删除
+    // removeEntity Hook 调用
+    // 若当前正在并行 tick，则挂起移除请求，等 waitAll 后主线程统一处理
+    // 若没有在并行 tick，直接标记移除即可
     void onActorRemoved(Actor* actor) {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
-        mPendingRemove.insert(actor);
+        if (mTickingNow.load()) {
+            // 并行 tick 期间：挂起，不动 mLiveActors
+            mPendingRemove.insert(actor);
+        } else {
+            // 非 tick 期间：直接移除
+            mLiveActors.erase(actor);
+        }
     }
 
-    // waitAll 后调用，统一清理延迟移除的实体
+    // waitAll 后在主线程调用，清理挂起的移除
     void flushPendingRemove() {
         std::unique_lock<std::recursive_mutex> lock(mLifecycleMutex);
         for (auto* a : mPendingRemove) {
@@ -82,10 +89,14 @@ public:
         mPendingRemove.clear();
     }
 
-    // 在主线程建立快照时使用，返回当前存活集合的拷贝
+    // 仅在主线程持锁时调用
     bool isActorAlive(Actor* actor) {
-        // 仅在持锁情况下调用（主线程快照阶段）
         return mLiveActors.count(actor) > 0;
+    }
+
+    // 从 mLiveActors 移除指定实体（快照过滤后使用）
+    void removeFromLive(Actor* actor) {
+        mLiveActors.erase(actor);
     }
 
     void clearLive() {
@@ -102,9 +113,13 @@ public:
     bool isCollecting() const { return mCollecting.load(); }
     void setCollecting(bool v) { mCollecting.store(v); }
 
-    void addStats(size_t total, size_t parallel, size_t serial) {
+    // 标记是否正在并行 tick
+    void setTickingNow(bool v) { mTickingNow.store(v); }
+    bool isTickingNow() const  { return mTickingNow.load(); }
+
+    void addStats(size_t total, size_t tasks, size_t serial) {
         mTotalStats    += total;
-        mParallelStats += parallel;
+        mParallelStats += tasks;
         mSerialStats   += serial;
     }
 
@@ -118,17 +133,17 @@ private:
     std::unique_ptr<FixedThreadPool> mPool;
 
     std::atomic<bool>            mCollecting{false};
+    std::atomic<bool>            mTickingNow{false};
+
     std::vector<ActorTickEntry>  mPendingQueue;
     std::unordered_set<Actor*>   mLiveActors;
-    std::unordered_set<Actor*>   mPendingRemove;   // 延迟移除集合
+    std::unordered_set<Actor*>   mPendingRemove;
 
-    // 统计
     std::atomic<size_t> mTotalStats{0};
     std::atomic<size_t> mParallelStats{0};
     std::atomic<size_t> mSerialStats{0};
     std::atomic<bool>   mStatsTaskRunning{false};
 
-    // 自动调整参数
     std::atomic<int> mAutoMaxEntities;
 };
 
