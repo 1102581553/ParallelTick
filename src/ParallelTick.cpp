@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <filesystem>
 
 namespace parallel_tick {
 
@@ -145,9 +146,17 @@ bool ParallelTick::load(ll::mod::NativeMod& self) {
     mImpl = std::make_unique<Impl>();
     mImpl->self = &self;
 
-    // 加载配置
+    // 确保配置目录存在
+    std::filesystem::create_directories(self.getConfigDir());
+
+    // 加载配置，如果失败则保存默认配置
     if (!loadConfig()) {
-        self.getLogger().error("Failed to load config, using defaults");
+        self.getLogger().warn("Failed to load config, using defaults and saving");
+        if (!saveConfig()) {
+            self.getLogger().error("Failed to save default config");
+        } else {
+            self.getLogger().info("Default config saved");
+        }
     }
 
     const auto& cfg = getConfig();
