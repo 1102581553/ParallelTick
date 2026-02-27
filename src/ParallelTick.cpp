@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <optional>
 
 namespace parallel_tick {
 
@@ -118,11 +119,15 @@ struct ParallelTick::Impl {
     std::mutex                                       crashMtx;
 
     // 统计
-    Stats stats;
+    struct {
+        std::atomic<size_t> totalMobsParalleled{0};
+        std::atomic<size_t> totalBatches{0};
+        std::atomic<size_t> crashedActors{0};
+    } stats;
 
     // 统计输出任务
     std::atomic<bool>                 statsRunning{false};
-    std::unique_ptr<ll::coro::CoroTask<>> statsTask;
+    std::optional<ll::coro::CoroTask<>> statsTask;
 
     // 最后一次清理的 tick 计数（用于周期性清理）
     std::atomic<int> lastCleanupTick{0};
@@ -279,17 +284,13 @@ void ParallelTick::addStats(size_t mobs, size_t batches) {
     mImpl->stats.totalBatches        += batches;
 }
 
-Stats& ParallelTick::getStats() {
-    return mImpl->stats;
-}
-
 void ParallelTick::printStats() {
-    auto& stats = mImpl->stats;
+    auto& st = mImpl->stats;
     getSelf().getLogger().info(
         "[ParallelTick Stats] totalMobs={} totalBatches={} crashed={}",
-        stats.totalMobsParalleled.load(),
-        stats.totalBatches.load(),
-        stats.crashedActors.load()
+        st.totalMobsParalleled.load(),
+        st.totalBatches.load(),
+        st.crashedActors.load()
     );
 }
 
@@ -301,26 +302,20 @@ void ParallelTick::startStatsTask() {
     if (!mImpl || mImpl->statsRunning.load()) return;
     mImpl->statsRunning = true;
 
-    // 在服务器线程上启动协程，每隔5秒输出一次统计信息
-    mImpl->statsTask = std::make_unique<ll::coro::CoroTask<>>(
-        ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
-            while (mImpl && mImpl->statsRunning.load()) {
-                co_await 100_tick; // 5秒 = 100 tick (50ms/tick)
-                if (!mImpl || !mImpl->statsRunning.load()) break;
-                printStats();
-            }
-            co_return;
-        }).launch(ll::thread::ServerThreadExecutor::getDefault())
-    );
+    mImpl->statsTask = ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
+        while (mImpl && mImpl->statsRunning.load()) {
+            co_await 100_tick; // 5秒 = 100 tick (50ms/tick)
+            if (!mImpl || !mImpl->statsRunning.load()) break;
+            printStats();
+        }
+        co_return;
+    }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
 void ParallelTick::stopStatsTask() {
     if (mImpl) {
         mImpl->statsRunning = false;
-        if (mImpl->statsTask) {
-            mImpl->statsTask->destroy(); // 强制销毁协程
-            mImpl->statsTask.reset();
-        }
+        mImpl->statsTask.reset(); // 析构协程，自动取消
     }
 }
 
