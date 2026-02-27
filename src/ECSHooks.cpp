@@ -10,8 +10,14 @@
 #include <cstdio>
 #include <exception>
 
+// 压制 levilamina "not yet publicly available" 的 C4996 警告
+// 这些符号实际存在于二进制中，只是文档标注未公开
+#pragma warning(push)
+#pragma warning(disable: 4996)
+
 namespace parallel_tick {
 
+// ── SEH 保护 ──────────────────────────────────────────────────────
 static LONG goalSehFilter(unsigned int code) {
     return (code == 0xE06D7363u) ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
 }
@@ -29,6 +35,7 @@ static int tickGoalSafe(ActorOwnerComponent& aoc) {
     catch (...) { fprintf(stderr, "[GoalSel] Unk\n"); return -2; }
 }
 
+// ── Hook ──────────────────────────────────────────────────────────
 LL_TYPE_INSTANCE_HOOK(
     HookGoalSelectorTick,
     ll::memory::HookPriority::Normal,
@@ -43,13 +50,15 @@ LL_TYPE_INSTANCE_HOOK(
     if (!cfg.enabled) { origin(registry); return; }
 
     // ── 1. 主线程收集 ─────────────────────────────────────────────
+    // EntityRegistry::mRegistry 是 TypedStorageImpl<entt::basic_registry<EntityId>>
+    // .get() 返回 entt::basic_registry<EntityId>&
+    auto& enttReg = registry.mRegistry.get();
+
     struct Entry { ActorOwnerComponent* comp; Actor* actor; };
     std::vector<Entry> entries;
     entries.reserve(2048);
 
-    registry.view<ActorOwnerComponent>().each([&](ActorOwnerComponent& aoc) {
-        // TypedStorage<8,8,unique_ptr<Actor>> 直接就是 unique_ptr<Actor>
-        // 所以 mActor 就是 unique_ptr<Actor>，直接 .get() 拿裸指针
+    enttReg.view<ActorOwnerComponent>().each([&](ActorOwnerComponent& aoc) {
         Actor* actor = aoc.mActor.get();
         if (!actor)                       return;
         if (actor->isPlayer())            return;
@@ -119,3 +128,5 @@ void registerECSHooks()   { HookGoalSelectorTick::hook();   }
 void unregisterECSHooks() { HookGoalSelectorTick::unhook(); }
 
 } // namespace parallel_tick
+
+#pragma warning(pop)
