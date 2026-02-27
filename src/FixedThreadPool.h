@@ -22,7 +22,6 @@ public:
                         mTasks.pop();
                     }
                     task();
-                    if (--mPending == 0) mDoneCv.notify_all();
                 }
             });
         }
@@ -34,9 +33,28 @@ public:
         for (auto& t : mWorkers) t.join();
     }
 
+    // 修改：确保异常安全，任务无论是否抛出异常都递减 mPending 并通知
     void submit(std::function<void()> f) {
         ++mPending;
-        { std::lock_guard lock(mMutex); mTasks.push(std::move(f)); }
+        {
+            std::lock_guard lock(mMutex);
+            mTasks.push([this, f = std::move(f)] {
+                // RAII 风格保证递减
+                auto decrement = [this] {
+                    if (--mPending == 0) {
+                        std::lock_guard lock(mDoneMutex);
+                        mDoneCv.notify_all();
+                    }
+                };
+                try {
+                    f();
+                    decrement();
+                } catch (...) {
+                    decrement();
+                    throw;  // 可根据需要改为只记录日志而不重新抛出
+                }
+            });
+        }
         mCv.notify_one();
     }
 
