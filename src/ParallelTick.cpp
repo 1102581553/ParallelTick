@@ -2,6 +2,8 @@
 #include "Config.h"
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
+#include <ll/api/chrono/GameChrono.h>
+#include <ll/api/thread/ServerThreadExecutor.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/legacy/ActorUniqueID.h>
 #include <atomic>
@@ -15,6 +17,8 @@
 #include <unordered_map>
 
 namespace parallel_tick {
+
+using namespace ll::chrono_literals;
 
 // ============================================================================
 // ThreadPool 实现
@@ -116,6 +120,10 @@ struct ParallelTick::Impl {
     // 统计
     Stats stats;
 
+    // 统计输出任务
+    std::atomic<bool>                 statsRunning{false};
+    std::unique_ptr<ll::coro::CoroTask<>> statsTask;
+
     // 最后一次清理的 tick 计数（用于周期性清理）
     std::atomic<int> lastCleanupTick{0};
 };
@@ -155,11 +163,20 @@ bool ParallelTick::load(ll::mod::NativeMod& self) {
     );
 
     registerECSHooks();
+
+    // 启动统计输出任务（如果启用）
+    if (cfg.statsEnabled) {
+        startStatsTask();
+    }
+
     return true;
 }
 
 bool ParallelTick::unload() {
     unregisterECSHooks();
+
+    // 停止统计输出任务
+    stopStatsTask();
 
     saveConfig(); // 可选保存
 
@@ -207,7 +224,6 @@ bool ParallelTick::isActorSafeToTick(Actor* a) const {
 
 void ParallelTick::markCrashed(Actor* a) {
     if (!a) return;
-    // 使用 getOrCreateUniqueID 获取 ActorUniqueID
     ActorUniqueID id = a->getOrCreateUniqueID();
     {
         std::lock_guard lk(mImpl->crashMtx);
@@ -265,6 +281,47 @@ void ParallelTick::addStats(size_t mobs, size_t batches) {
 
 Stats& ParallelTick::getStats() {
     return mImpl->stats;
+}
+
+void ParallelTick::printStats() {
+    auto& stats = mImpl->stats;
+    getSelf().getLogger().info(
+        "[ParallelTick Stats] totalMobs={} totalBatches={} crashed={}",
+        stats.totalMobsParalleled.load(),
+        stats.totalBatches.load(),
+        stats.crashedActors.load()
+    );
+}
+
+// ============================================================================
+// 统计输出任务（协程）
+// ============================================================================
+
+void ParallelTick::startStatsTask() {
+    if (!mImpl || mImpl->statsRunning.load()) return;
+    mImpl->statsRunning = true;
+
+    // 在服务器线程上启动协程，每隔5秒输出一次统计信息
+    mImpl->statsTask = std::make_unique<ll::coro::CoroTask<>>(
+        ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
+            while (mImpl && mImpl->statsRunning.load()) {
+                co_await 100_tick; // 5秒 = 100 tick (50ms/tick)
+                if (!mImpl || !mImpl->statsRunning.load()) break;
+                printStats();
+            }
+            co_return;
+        }).launch(ll::thread::ServerThreadExecutor::getDefault())
+    );
+}
+
+void ParallelTick::stopStatsTask() {
+    if (mImpl) {
+        mImpl->statsRunning = false;
+        if (mImpl->statsTask) {
+            mImpl->statsTask->destroy(); // 强制销毁协程
+            mImpl->statsTask.reset();
+        }
+    }
 }
 
 } // namespace parallel_tick
