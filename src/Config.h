@@ -1,11 +1,10 @@
 #pragma once
-#include <ll/api/Config.h>
 #include <cstddef>
 
 namespace parallel_tick {
 
 struct Config {
-    int  version = 2;               // 配置文件版本
+    int  version = 2;                // 配置文件版本
     bool enabled = true;             // 全局开关
     bool debug   = false;            // 调试输出
 
@@ -17,6 +16,9 @@ struct Config {
     // 崩溃黑名单清理
     int  cleanupIntervalTicks = 100;  // 每多少 tick 清理一次过期的黑名单
     int  maxExpiredAge = 600;         // 实体加入黑名单后最多保留多少 tick（约30秒）
+
+    // 统计输出
+    bool statsEnabled = true;         // 是否启用统计信息输出（每5秒）
 };
 
 // 全局配置访问
