@@ -146,7 +146,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     void
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
-    auto& conf = pt.getConfig();
+    auto  conf = pt.getConfig(); // 值拷贝，线程安全
 
     if (!conf.enabled) {
         origin();
@@ -158,6 +158,11 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     pt.setCollecting(false);
 
     auto list = pt.takeQueue();
+
+    if (conf.debug) {
+        pt.getSelf().getLogger().info("Queue size: {}", list.size());
+    }
+
     if (list.empty()) return;
 
     // 按棋盘格分组
@@ -181,7 +186,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
     auto& pool = pt.getPool();
 
-    // 逐 phase 提交，phase 内并行，phase 间串行
     for (int p = 0; p < 4; ++p) {
         auto& phaseList = groups.phase[p];
         if (phaseList.empty()) continue;
@@ -191,7 +195,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             Actor** batchBegin = phaseList.data() + i;
             size_t  batchCount = end - i;
 
-            pool.submit([&pt, &conf, batchBegin, batchCount] {
+            pool.submit([&pt, conf, batchBegin, batchCount] {
                 std::shared_lock lock(pt.getLifecycleMutex());
                 for (size_t j = 0; j < batchCount; ++j) {
                     Actor* actor = batchBegin[j];
@@ -199,9 +203,13 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                     if (conf.debug) {
                         auto typeId   = (int)actor->getEntityTypeId();
                         auto entityId = actor->getRuntimeID().rawID;
-                        pt.getSelf().getLogger().info("Ticking typeId={} id={}", typeId, entityId);
+                        pt.getSelf().getLogger().info(
+                            "Ticking typeId={} id={}", typeId, entityId
+                        );
                         actor->normalTick();
-                        pt.getSelf().getLogger().info("Done    typeId={} id={}", typeId, entityId);
+                        pt.getSelf().getLogger().info(
+                            "Done    typeId={} id={}", typeId, entityId
+                        );
                     } else {
                         actor->normalTick();
                     }
@@ -209,7 +217,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             });
         }
 
-        pool.waitAll(); // phase 结束后等所有 batch 完成再进下一 phase
+        pool.waitAll();
     }
 }
 
