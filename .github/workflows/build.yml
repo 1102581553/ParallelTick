@@ -3,8 +3,12 @@ name: Build
 on:
   pull_request:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
+
+env:
+  XMAKE_GLOBALDIR: ${{ github.workspace }}/.xmake-global
+  XMAKE_PKG_CACHEDIR: ${{ github.workspace }}/.xmake-cache
 
 jobs:
   build:
@@ -17,63 +21,69 @@ jobs:
         with:
           xmake-version: latest
 
-      # 获取 xmake 版本（用于缓存键）
-      - name: Get xmake version
-        id: xmake_version
+      # ── 计算缓存 key ──
+      - name: Hash sources
+        id: hashes
         run: |
-          $version = & xmake --version | Select-String -Pattern "xmake v(\d+\.\d+\.\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
-          echo "version=$version" >> $env:GITHUB_OUTPUT
+          $srcHash = (Get-FileHash -Algorithm SHA256 -InputStream (
+            [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes(
+              (Get-ChildItem -Recurse -Include *.cpp,*.h,*.hpp -Path src | Get-Content -Raw) + (Get-Content xmake.lua -Raw)
+            ))
+          )).Hash.Substring(0, 16)
+          $depsHash = (Get-FileHash -Algorithm SHA256 -Path xmake.lua).Hash.Substring(0, 16)
+          echo "src=$srcHash" >> $env:GITHUB_OUTPUT
+          echo "deps=$depsHash" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
-      # 确保缓存目录存在（只创建真实路径）
-      - name: Ensure cache directories exist
-        run: |
-          New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\.xmake"
-          New-Item -ItemType Directory -Force -Path "build"
-        shell: pwsh
-
-      # 缓存 xmake 包（依赖）
+      # ── 缓存 xmake 包（最大瓶颈）──
+      # 只要 xmake.lua 不变，依赖包不会变
       - name: Cache xmake packages
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         id: cache-packages
-        continue-on-error: true
         with:
-          path: ${{ env.LOCALAPPDATA }}\.xmake
-          key: ${{ runner.os }}-${{ runner.arch }}-xmake-${{ steps.xmake_version.outputs.version }}-packages-${{ hashFiles('xmake.lua') }}
+          path: |
+            ${{ env.XMAKE_GLOBALDIR }}
+            ${{ env.XMAKE_PKG_CACHEDIR }}
+            ${{ env.LOCALAPPDATA }}\.xmake
+          key: pkgs-${{ steps.hashes.outputs.deps }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-xmake-${{ steps.xmake_version.outputs.version }}-packages-
-            ${{ runner.os }}-${{ runner.arch }}-xmake-
+            pkgs-
+          save-always: true
 
-      # 缓存构建中间文件
-      - name: Cache build output
-        uses: actions/cache@v5
+      # ── 缓存构建中间产物（.obj）──
+      # 源码不变 = 编译结果不变
+      - name: Cache build
+        uses: actions/cache@v4
         id: cache-build
-        continue-on-error: true
         with:
           path: build
-          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ github.sha }}
+          key: build-${{ steps.hashes.outputs.src }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-build-
-            ${{ runner.os }}-build-
+            build-
+          save-always: true
 
-      # 显示缓存命中状态
-      - name: Check cache status
-        if: always()
+      - name: Cache status
         run: |
-          echo "Packages cache hit: ${{ steps.cache-packages.outputs.cache-hit }}"
-          echo "Build cache hit: ${{ steps.cache-build.outputs.cache-hit }}"
+          echo "Packages cache: ${{ steps.cache-packages.outputs.cache-hit }}"
+          echo "Build cache: ${{ steps.cache-build.outputs.cache-hit }}"
 
-      # 配置项目
+      # ── Configure（仅在需要时）──
       - name: Configure
+        if: steps.cache-build.outputs.cache-hit != 'true'
         run: xmake f -a x64 -m release -p windows -y
 
-      # 并行构建
+      # ── 构建 ──
       - name: Build
-        run: xmake -v -y -j $env:NUMBER_OF_PROCESSORS
+        run: |
+          # 确保配置存在（缓存命中但配置丢失的情况）
+          if (-not (Test-Path "build\.gens")) {
+            xmake f -a x64 -m release -p windows -y
+          }
+          xmake -y -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
 
-      # 上传构建产物
-      - uses: actions/upload-artifact@v6
+      # ── 产物 ──
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}-${{ github.sha }}-windows-x64
+          name: ${{ github.event.repository.name }}-windows-x64
           path: bin/
