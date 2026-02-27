@@ -11,6 +11,7 @@
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
 #include <mc/legacy/ActorRuntimeID.h>
+#include <mc/world/level/dimension/Dimension.h>  // 提供 Dimension 完整定义
 
 #include <cmath>
 #include <vector>
@@ -96,14 +97,11 @@ LL_TYPE_INSTANCE_HOOK(
     ::Actor& actor
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
-    // 先从存活集合移除（写锁保护）
     pt.onActorRemoved(&actor);
-    // 再写锁保护原始移除操作
     std::unique_lock lock(pt.getLifecycleMutex());
     return origin(actor);
 }
 
-// 辅助函数：从 WeakEntityRef 获取 Actor 指针
 static Actor* tryGetActorFromWeakRef(WeakEntityRef const& ref) {
     if (auto stackRef = ref.lock()) {
         if (EntityContext* ctx = stackRef.operator->()) {
@@ -130,7 +128,7 @@ LL_TYPE_INSTANCE_HOOK(
 }
 
 // ----------------------------------------------------------------
-// Actor::tick 拦截 Hook — 收集阶段把 actor 放入队列
+// Actor::tick 拦截 Hook
 // ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
@@ -152,12 +150,12 @@ LL_TYPE_INSTANCE_HOOK(
         return origin(region);
     }
 
-    pt.collectActor(this, region);  // 内部写锁
+    pt.collectActor(this, region);
     return true;
 }
 
 // ----------------------------------------------------------------
-// Level::$tick 外层 Hook — 开关收集窗口 + 并行派发
+// Level::$tick 外层 Hook
 // ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
@@ -179,22 +177,21 @@ LL_TYPE_INSTANCE_HOOK(
     origin();
     pt.setCollecting(false);
 
-    auto list = pt.takeQueue();  // 写锁取出队列，释放锁
+    auto list = pt.takeQueue();
 
     if (conf.debug) {
         pt.getSelf().getLogger().info("Queue size: {}", list.size());
     }
 
     if (list.empty()) {
-        pt.clearLive();  // 写锁
+        pt.clearLive();
         return;
     }
 
-    // 过滤：使用读锁检查存活
     std::vector<parallel_tick::ActorTickEntry> valid;
     valid.reserve(list.size());
     for (auto& e : list) {
-        if (e.actor && pt.isActorAlive(e.actor)) {  // isActorAlive 内部读锁
+        if (e.actor && pt.isActorAlive(e.actor)) {
             valid.push_back(e);
         }
     }
@@ -204,7 +201,6 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 四色分组
     struct Groups {
         std::vector<parallel_tick::ActorTickEntry> phase[4];
     } groups;
@@ -236,31 +232,28 @@ LL_TYPE_INSTANCE_HOOK(
             size_t batchCount = end - i;
 
             pool.submit([&pt, conf, batchBegin, batchCount] {
-                // 任务开始时获取读锁，确保在 tick 期间实体不会被移除
                 std::shared_lock lock(pt.getLifecycleMutex());
 
                 for (size_t j = 0; j < batchCount; ++j) {
                     auto& entry = batchBegin[j];
                     if (!entry.actor || !pt.isActorAlive(entry.actor)) continue;
 
-                    // 动态获取当前有效的 BlockSource，避免使用存储的指针
-                    BlockSource& region = entry.actor->getDimension().getBlockSource();
+                    // 动态获取当前有效的 BlockSource（使用 Dimension 的 getBlockSourceFromMainChunkSource）
+                    BlockSource& region = entry.actor->getDimension().getBlockSourceFromMainChunkSource();
 
-                    // 记录详细日志（即使 debug 为 false 也记录崩溃前信息）
                     auto typeId   = (int)entry.actor->getEntityTypeId();
                     auto entityId = entry.actor->getRuntimeID().rawID;
                     pt.getSelf().getLogger().info(
                         "[ParallelTick] Starting tick: typeId={}, id={}", typeId, entityId
                     );
 
-                    // 执行 tick，并捕获可能的异常（记录后重新抛出）
                     try {
                         entry.actor->tick(region);
                     } catch (...) {
                         pt.getSelf().getLogger().error(
                             "[ParallelTick] Exception during tick: typeId={}, id={}", typeId, entityId
                         );
-                        throw; // 重新抛出以触发崩溃，便于调试
+                        throw;
                     }
 
                     if (conf.debug) {
@@ -275,7 +268,7 @@ LL_TYPE_INSTANCE_HOOK(
         pool.waitAll();
     }
 
-    pt.clearLive();  // 写锁清空存活集合
+    pt.clearLive();
 }
 
 // ----------------------------------------------------------------
