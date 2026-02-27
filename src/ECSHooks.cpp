@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────
 #pragma once
 
-#include <ll/api/plugin/NativePlugin.h>
+#include <ll/api/mod/NativeMod.h>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
