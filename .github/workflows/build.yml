@@ -17,29 +17,29 @@ jobs:
         with:
           xmake-version: latest
 
-      # 缓存 xmake 包目录（存储下载和编译的依赖）
+      # 正确缓存 xmake 包目录（Windows 专用路径）
       - name: Cache xmake packages
         uses: actions/cache@v5
         id: cache-xmake
         with:
           path: |
-            ~/.xmake
+            ${{ env.LOCALAPPDATA }}\.xmake
             build
           key: ${{ runner.os }}-xmake-${{ hashFiles('xmake.lua') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-xmake-${{ hashFiles('xmake.lua') }}-
             ${{ runner.os }}-xmake-
 
-      # 调试：查看缓存命中情况（可选）
+      # 可选：查看缓存命中情况
       - name: Check cache status
         if: steps.cache-xmake.outputs.cache-hit != 'true'
         run: echo "Cache miss, will download dependencies."
 
-      # 配置项目（如果缓存命中，会跳过依赖下载/编译）
+      # 配置项目（如果缓存命中，跳过依赖下载/编译）
       - name: Configure
         run: xmake f -a x64 -m release -p windows -y
 
-      # 构建（启用并行编译）
+      # 并行构建
       - name: Build
         run: xmake -v -y -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
