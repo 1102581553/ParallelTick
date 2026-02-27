@@ -17,7 +17,7 @@ jobs:
         with:
           xmake-version: latest
 
-      # 获取 xmake 版本，用于缓存键
+      # 获取 xmake 版本（用于缓存键）
       - name: Get xmake version
         id: xmake_version
         run: |
@@ -25,7 +25,7 @@ jobs:
           echo "version=$version" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
-      # 确保缓存路径存在（避免缓存失败）
+      # 确保缓存目录存在（只创建真实路径）
       - name: Ensure cache directories exist
         run: |
           New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\.xmake"
@@ -36,6 +36,7 @@ jobs:
       - name: Cache xmake packages
         uses: actions/cache@v5
         id: cache-packages
+        continue-on-error: true
         with:
           path: ${{ env.LOCALAPPDATA }}\.xmake
           key: ${{ runner.os }}-${{ runner.arch }}-xmake-${{ steps.xmake_version.outputs.version }}-packages-${{ hashFiles('xmake.lua') }}
@@ -43,18 +44,21 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-xmake-${{ steps.xmake_version.outputs.version }}-packages-
             ${{ runner.os }}-${{ runner.arch }}-xmake-
 
-      # 缓存构建中间文件（加速编译）
+      # 缓存构建中间文件
       - name: Cache build output
         uses: actions/cache@v5
         id: cache-build
+        continue-on-error: true
         with:
           path: build
           key: ${{ runner.os }}-${{ runner.arch }}-build-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-build-
+            ${{ runner.os }}-build-
 
       # 显示缓存命中状态
       - name: Check cache status
+        if: always()
         run: |
           echo "Packages cache hit: ${{ steps.cache-packages.outputs.cache-hit }}"
           echo "Build cache hit: ${{ steps.cache-build.outputs.cache-hit }}"
