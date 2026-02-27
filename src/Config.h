@@ -1,7 +1,6 @@
 #pragma once
 
 struct Config {
-    // LeviLamina 1.9.5 要求: ll::config::IsConfig 检查此字段
     int   version                = 1;
 
     bool  enabled                = true;
@@ -9,7 +8,6 @@ struct Config {
     bool  stats                  = true;
     int   threadCount            = 0;
 
-    // gridSizeBase=64 → 同相实体最小间距 128 格，远超任何实体交互范围
     float gridSizeBase           = 64.0f;
 
     int   maxEntitiesPerTask     = 256;
@@ -19,4 +17,12 @@ struct Config {
     bool  autoAdjust             = true;
     int   targetTickMs           = 40;
     int   adjustStep             = 10;
+
+    // ── 崩溃保护 ──
+    // 单个实体 tick 超时（毫秒），超时则标记崩溃
+    int   actorTickTimeoutMs     = 5000;
+    // 单个实体连续 SEH/异常次数超过此值则永久禁用
+    int   maxCrashCountPerActor  = 1;
+    // 是否尝试 kill 崩溃实体
+    bool  killCrashedActors      = true;
 };
