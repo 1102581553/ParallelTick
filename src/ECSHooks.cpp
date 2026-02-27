@@ -2,7 +2,7 @@
 #include <ll/api/memory/Hook.h>
 #include <mc/entity/systems/GoalSelectorSystem.h>
 #include <mc/entity/components/ActorOwnerComponent.h>
-#include <mc/deps/ecs/EntityRegistry.h>
+#include <mc/deps/ecs/gamerefs_entity/EntityRegistry.h>
 #include <mc/world/actor/Actor.h>
 #include <windows.h>
 #include <vector>
