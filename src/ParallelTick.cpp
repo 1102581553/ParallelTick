@@ -24,7 +24,6 @@ using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntity
 
 namespace parallel_tick {
 
-// 辅助函数：获取当前时间字符串（线程安全）
 static std::string currentTimeString() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
@@ -40,19 +39,22 @@ ParallelTick& ParallelTick::getInstance() {
     return instance;
 }
 
-void ParallelTick::startDebugTask() {
-    if (mDebugTaskRunning.exchange(true)) return;
+void ParallelTick::startStatsTask() {
+    if (mStatsTaskRunning.exchange(true)) return;
     ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
-        while (mDebugTaskRunning.load()) {
+        while (mStatsTaskRunning.load()) {
             co_await std::chrono::seconds(5);
             ll::thread::ServerThreadExecutor::getDefault().execute([this] {
-                if (!mConfig.debug) return;
+                bool outputStats = mConfig.stats;
+                if (!outputStats) return;  // 仅当 stats 开启时输出
+
                 size_t p0 = mPhaseStats[0].exchange(0);
                 size_t p1 = mPhaseStats[1].exchange(0);
                 size_t p2 = mPhaseStats[2].exchange(0);
                 size_t p3 = mPhaseStats[3].exchange(0);
                 size_t u  = mUnsafeStats.exchange(0);
                 size_t total = p0 + p1 + p2 + p3 + u;
+
                 if (total > 0) {
                     getSelf().getLogger().info(
                         "[{}][ParallelStats] Total={}, Parallel={}({}/{}/{}/{}), Serial={}",
@@ -64,36 +66,45 @@ void ParallelTick::startDebugTask() {
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
-void ParallelTick::stopDebugTask() { mDebugTaskRunning.store(false); }
+void ParallelTick::stopStatsTask() { mStatsTaskRunning.store(false); }
 
 bool ParallelTick::load() {
     auto path = getSelf().getConfigDir() / "config.json";
     if (!ll::config::loadConfig(mConfig, path))
         ll::config::saveConfig(mConfig, path);
-    getSelf().getLogger().info("[{}][ParallelTick::load] Config loaded, enabled={}, debug={}", 
-                               currentTimeString(), mConfig.enabled, mConfig.debug);
+    getSelf().getLogger().info("[{}][ParallelTick::load] Config loaded, enabled={}, debug={}, stats={}, threadCount={}",
+                               currentTimeString(), mConfig.enabled, mConfig.debug, mConfig.stats, mConfig.threadCount);
     return true;
 }
 
 bool ParallelTick::enable() {
+    int threadCount = mConfig.threadCount;
+    if (threadCount <= 0) {
+        threadCount = std::max(1u, std::thread::hardware_concurrency() - 1);
+    }
+    mPool = std::make_unique<FixedThreadPool>(threadCount);
+
     registerHooks();
-    getSelf().getLogger().info("[{}][ParallelTick::enable] Hooks registered", currentTimeString());
-    if (mConfig.debug) startDebugTask();
+    getSelf().getLogger().info("[{}][ParallelTick::enable] Hooks registered, thread pool size={}",
+                               currentTimeString(), threadCount);
+
+    if (mConfig.stats || mConfig.debug) {
+        startStatsTask();
+    }
     return true;
 }
 
 bool ParallelTick::disable() {
     unregisterHooks();
-    stopDebugTask();
+    stopStatsTask();
+    mPool.reset();
     getSelf().getLogger().info("[{}][ParallelTick::disable] Hooks unregistered", currentTimeString());
     return true;
 }
 
 // ----------------------------------------------------------------
-// 生命周期写锁 Hooks
+// Hooks
 // ----------------------------------------------------------------
-
-// 注意：ParallelAddEntityLock 已被移除，因为它不需要保护我们的数据结构，且可能导致递归锁问题。
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelRemoveActorLock,
@@ -105,12 +116,11 @@ LL_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
-    // 先获取递归互斥量（允许同一线程重复加锁）
     std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Enter, actor={:p}", currentTimeString(), (void*)&actor);
     }
-    pt.onActorRemoved(&actor);   // 内部会加锁，但递归锁允许
+    pt.onActorRemoved(&actor);
     auto result = origin(actor);
     if (conf.debug) {
         pt.getSelf().getLogger().info("[{}][ParallelRemoveActorLock] Exit", currentTimeString());
@@ -158,10 +168,6 @@ LL_TYPE_INSTANCE_HOOK(
     return result;
 }
 
-// ----------------------------------------------------------------
-// Actor::tick 拦截 Hook
-// ----------------------------------------------------------------
-
 LL_TYPE_INSTANCE_HOOK(
     ParallelActorTickHook,
     ll::memory::HookPriority::Normal,
@@ -200,10 +206,6 @@ LL_TYPE_INSTANCE_HOOK(
     }
     return true;
 }
-
-// ----------------------------------------------------------------
-// Level::$tick 外层 Hook
-// ----------------------------------------------------------------
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelLevelTickHook,
@@ -277,7 +279,9 @@ LL_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    pt.getSelf().getLogger().info("[{}][ParallelTick] Valid actors after filtering: {}", currentTimeString(), valid.size());
+    if (conf.debug) {
+        pt.getSelf().getLogger().info("[{}][ParallelTick] Valid actors after filtering: {}", currentTimeString(), valid.size());
+    }
 
     struct Groups {
         std::vector<parallel_tick::ActorTickEntry> phase[4];
@@ -295,11 +299,11 @@ LL_TYPE_INSTANCE_HOOK(
         }
     }
 
+    pt.addStats(
+        (int)groups.phase[0].size(), (int)groups.phase[1].size(),
+        (int)groups.phase[2].size(), (int)groups.phase[3].size(), 0
+    );
     if (conf.debug) {
-        pt.addStats(
-            (int)groups.phase[0].size(), (int)groups.phase[1].size(),
-            (int)groups.phase[2].size(), (int)groups.phase[3].size(), 0
-        );
         pt.getSelf().getLogger().info("[{}][ParallelTick] Phase sizes: {} {} {} {}", 
                                       currentTimeString(), groups.phase[0].size(), groups.phase[1].size(), groups.phase[2].size(), groups.phase[3].size());
     }
@@ -315,7 +319,9 @@ LL_TYPE_INSTANCE_HOOK(
             continue;
         }
 
-        pt.getSelf().getLogger().info("[{}][ParallelTick] Processing phase {} with {} actors", currentTimeString(), p, phaseList.size());
+        if (conf.debug) {
+            pt.getSelf().getLogger().info("[{}][ParallelTick] Processing phase {} with {} actors", currentTimeString(), p, phaseList.size());
+        }
 
         for (size_t i = 0; i < phaseList.size(); i += (size_t)conf.batchSize) {
             size_t end        = std::min(i + (size_t)conf.batchSize, phaseList.size());
@@ -328,7 +334,6 @@ LL_TYPE_INSTANCE_HOOK(
             }
 
             pool.submit([&pt, conf, batchBegin, batchCount, p, i] {
-                // 由于递归互斥量不支持共享锁，这里也使用独占锁
                 std::unique_lock<std::recursive_mutex> lock(pt.getLifecycleMutex());
                 if (conf.debug) {
                     pt.getSelf().getLogger().info("[{}][ParallelTick][Task] Batch started: phase={}, index={}, count={}", 
@@ -355,10 +360,12 @@ LL_TYPE_INSTANCE_HOOK(
 
                     auto typeId   = (int)entry.actor->getEntityTypeId();
                     auto entityId = entry.actor->getRuntimeID().rawID;
-                    pt.getSelf().getLogger().info(
-                        "[{}][ParallelTick][Task] Starting tick: typeId={}, id={}, actor={:p}, region={:p}",
-                        currentTimeString(), typeId, entityId, (void*)entry.actor, (void*)&region
-                    );
+                    if (conf.debug) {
+                        pt.getSelf().getLogger().info(
+                            "[{}][ParallelTick][Task] Starting tick: typeId={}, id={}, actor={:p}, region={:p}",
+                            currentTimeString(), typeId, entityId, (void*)entry.actor, (void*)&region
+                        );
+                    }
 
                     try {
                         entry.actor->tick(region);
@@ -406,12 +413,7 @@ LL_TYPE_INSTANCE_HOOK(
     }
 }
 
-// ----------------------------------------------------------------
-// 注册 / 注销
-// ----------------------------------------------------------------
-
 void parallel_tick::registerHooks() {
-    // ParallelAddEntityLock 已移除
     ParallelRemoveActorLock::hook();
     ParallelRemoveWeakRefLock::hook();
     ParallelActorTickHook::hook();
@@ -419,7 +421,6 @@ void parallel_tick::registerHooks() {
 }
 
 void parallel_tick::unregisterHooks() {
-    // ParallelAddEntityLock 已移除
     ParallelRemoveActorLock::unhook();
     ParallelRemoveWeakRefLock::unhook();
     ParallelActorTickHook::unhook();
