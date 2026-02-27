@@ -32,7 +32,7 @@ static int invokeFullySafe(std::function<void()>& f) {
 
 class FixedThreadPool {
 public:
-    explicit FixedThreadPool(size_t n, size_t stackSize = 8*1024*1024)
+    explicit FixedThreadPool(size_t n, size_t stackSize = 8 * 1024 * 1024)
         : mStop(false), mPending(0) {
         for (size_t i = 0; i < n; ++i) {
             struct P { FixedThreadPool* p; };
@@ -45,6 +45,7 @@ public:
             if (h) mWorkers.push_back(h); else delete param;
         }
     }
+
     ~FixedThreadPool() {
         mStop.store(true, std::memory_order_release);
         mCv.notify_all();
@@ -52,22 +53,30 @@ public:
             WaitForSingleObject(h, INFINITE); CloseHandle(h);
         }
     }
+
     void submit(std::function<void()> f) {
         mPending.fetch_add(1, std::memory_order_acq_rel);
         { std::lock_guard<std::mutex> lk(mMutex); mTasks.push(std::move(f)); }
         mCv.notify_one();
     }
+
     void waitAll() {
         std::unique_lock<std::mutex> lk(mDoneMutex);
-        mDoneCv.wait(lk, [this]{ return mPending.load(std::memory_order_acquire)==0; });
+        mDoneCv.wait(lk, [this]{
+            return mPending.load(std::memory_order_acquire) == 0;
+        });
     }
+
     bool waitAllFor(std::chrono::milliseconds t) {
         std::unique_lock<std::mutex> lk(mDoneMutex);
         return mDoneCv.wait_for(lk, t, [this]{
-            return mPending.load(std::memory_order_acquire)==0;
+            return mPending.load(std::memory_order_acquire) == 0;
         });
     }
-    int pendingCount() const { return mPending.load(std::memory_order_acquire); }
+
+    int    pendingCount() const { return mPending.load(std::memory_order_acquire); }
+    size_t threadCount()  const { return mWorkers.size(); }
+
 private:
     void workerLoop() {
         while (true) {
@@ -75,21 +84,25 @@ private:
             {
                 std::unique_lock<std::mutex> lk(mMutex);
                 mCv.wait(lk, [this]{
-                    return mStop.load(std::memory_order_acquire)||!mTasks.empty();
+                    return mStop.load(std::memory_order_acquire) || !mTasks.empty();
                 });
-                if (mStop.load(std::memory_order_acquire)&&mTasks.empty()) return;
+                if (mStop.load(std::memory_order_acquire) && mTasks.empty()) return;
                 task = std::move(mTasks.front()); mTasks.pop();
             }
             invokeFullySafe(task);
-            if (mPending.fetch_sub(1, std::memory_order_acq_rel)==1) {
+            if (mPending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 std::lock_guard<std::mutex> lk(mDoneMutex);
                 mDoneCv.notify_all();
             }
         }
     }
-    std::vector<HANDLE> mWorkers;
+
+    std::vector<HANDLE>             mWorkers;
     std::queue<std::function<void()>> mTasks;
-    std::mutex mMutex; std::condition_variable mCv;
-    std::mutex mDoneMutex; std::condition_variable mDoneCv;
-    std::atomic<int> mPending; std::atomic<bool> mStop;
+    std::mutex                      mMutex;
+    std::condition_variable         mCv;
+    std::mutex                      mDoneMutex;
+    std::condition_variable         mDoneCv;
+    std::atomic<int>                mPending;
+    std::atomic<bool>               mStop;
 };
