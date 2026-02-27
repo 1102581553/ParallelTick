@@ -13,8 +13,15 @@ class ActorUniqueID;
 
 namespace parallel_tick {
 
+// 配置结构（已在 Config.h 定义）
 struct Config;
-struct Stats;
+
+// 统计结构 - 必须在使用前定义
+struct Stats {
+    std::atomic<size_t> totalMobsParalleled{0};
+    std::atomic<size_t> totalBatches{0};
+    std::atomic<size_t> crashedActors{0};
+};
 
 // 线程池接口
 class ThreadPool {
