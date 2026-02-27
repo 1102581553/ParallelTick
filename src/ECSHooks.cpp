@@ -5,17 +5,18 @@
 #include <mc/world/level/Level.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/player/Player.h>
+#include <mc/world/actor/Mob.h>
 #include <vector>
 #include <chrono>
 
 namespace parallel_tick {
 
-// Hook Level::tick
+// Hook Level::tick - 虚函数需要使用 $ 前缀
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
     Level,
-    &Level::tick,
+    &Level::$tick,
     void
 ) {
     auto& inst = ParallelTick::getInstance();
@@ -29,30 +30,31 @@ LL_TYPE_INSTANCE_HOOK(
     inst.setParallelPhase(true);
 
     // 收集所有非玩家生物
-    std::vector<Actor*> entities;
-    this->forEachEntity([&](Actor& actor) -> bool {
-        if (actor.isMob() && !actor.isPlayer() && inst.isActorSafeToTick(&actor)) {
-            entities.push_back(&actor);
+    std::vector<Mob*> mobs;
+    for (Actor* actor : this->getRuntimeActorList()) {
+        if (actor && actor->hasCategory(ActorCategory::Mob) && !actor->isPlayer()) {
+            if (inst.isActorSafeToTick(actor)) {
+                mobs.push_back(static_cast<Mob*>(actor));
+            }
         }
-        return true;
-    });
+    }
 
-    size_t total = entities.size();
+    size_t total = mobs.size();
     size_t batchSize = config.maxEntitiesPerTask;
     size_t batches = (total + batchSize - 1) / batchSize;
 
     for (size_t i = 0; i < total; i += batchSize) {
         size_t end = std::min(i + batchSize, total);
-        auto task = [&inst, entities, i, end]() {
+        auto task = [&inst, mobs, i, end]() {
             for (size_t j = i; j < end; ++j) {
-                Actor* actor = entities[j];
+                Mob* mob = mobs[j];
                 try {
-                    actor->aiStep();
+                    mob->aiStep();
                 } catch (...) {
-                    inst.markCrashed(actor);
+                    inst.markCrashed(mob);
                     inst.getSelf().getLogger().error(
-                        "Actor {} crashed during parallel tick",
-                        actor->getOrCreateUniqueID().rawID
+                        "Mob {} crashed during parallel tick",
+                        mob->getOrCreateUniqueID().rawID
                     );
                 }
             }
