@@ -15,9 +15,7 @@
 #include <mc/legacy/ActorRuntimeID.h>
 
 #include <cmath>
-#include <thread>
 #include <vector>
-#include <future>
 
 using LevelRemoveByActor   = ::OwnerPtr<::EntityContext> (Level::*)(::Actor&);
 using LevelRemoveByWeakRef = ::OwnerPtr<::EntityContext> (Level::*)(::WeakEntityRef);
@@ -31,7 +29,6 @@ ParallelTick& ParallelTick::getInstance() {
 
 void ParallelTick::startDebugTask() {
     if (mDebugTaskRunning.exchange(true)) return;
-
     ll::coro::keepThis([this]() -> ll::coro::CoroTask<> {
         while (mDebugTaskRunning.load()) {
             co_await std::chrono::seconds(5);
@@ -46,7 +43,7 @@ void ParallelTick::startDebugTask() {
                 if (total > 0) {
                     getSelf().getLogger().info(
                         "Parallel Stats (5s): Total={}, Parallel={}({}/{}/{}/{}), Serial={}",
-                        total, (p0 + p1 + p2 + p3), p0, p1, p2, p3, u
+                        total, (p0+p1+p2+p3), p0, p1, p2, p3, u
                     );
                 }
             });
@@ -58,9 +55,8 @@ void ParallelTick::stopDebugTask() { mDebugTaskRunning.store(false); }
 
 bool ParallelTick::load() {
     auto path = getSelf().getConfigDir() / "config.json";
-    if (!ll::config::loadConfig(mConfig, path)) {
+    if (!ll::config::loadConfig(mConfig, path))
         ll::config::saveConfig(mConfig, path);
-    }
     return true;
 }
 
@@ -115,9 +111,33 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(std::move(entityRef));
 }
 
+// --- normalTick 拦截 Hook ---
+
+LL_AUTO_TYPE_INSTANCE_HOOK(
+    ParallelNormalTickHook,
+    ll::memory::HookPriority::Normal,
+    Actor,
+    &Actor::$normalTick,
+    void
+) {
+    auto& pt   = parallel_tick::ParallelTick::getInstance();
+    auto& conf = pt.getConfig();
+
+    if (!conf.enabled || !pt.isCollecting()) {
+        origin();
+        return;
+    }
+
+    if (this->isPlayer() || this->isSimulatedPlayer()) {
+        origin();
+        return;
+    }
+
+    pt.collectActor(this);
+}
+
 // --- 并行派发核心 Hook ---
-#pragma warning(push)
-#pragma warning(disable: 4996)
+
 LL_AUTO_TYPE_INSTANCE_HOOK(
     ParallelTickDispatchHook,
     ll::memory::HookPriority::Normal,
@@ -133,99 +153,64 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    parallel_tick::ParallelGroups groups;
+    pt.setCollecting(true);
+    origin();
+    pt.setCollecting(false);
 
-    {
-        std::shared_lock lock(pt.getLifecycleMutex());
-        for (Actor* actor : this->getRuntimeActorList()) {
-            if (!actor) continue;
+    auto list = pt.takeQueue();
+    if (list.empty()) return;
 
-            bool isDangerous = actor->isPlayer() || actor->isSimulatedPlayer();
-            if (conf.parallelItemsOnly
-                && actor->getEntityTypeId() != ActorType::ItemEntity
-                && actor->getEntityTypeId() != ActorType::Experience) {
-                isDangerous = true;
-            }
+    // 按棋盘格分组
+    struct Groups { std::vector<Actor*> phase[4]; } groups;
 
-            if (isDangerous) {
-                groups.unsafe.push_back(actor);
-            } else {
-                auto const& pos = actor->getPosition();
-                int gx    = static_cast<int>(std::floor(pos.x / conf.gridSize));
-                int gz    = static_cast<int>(std::floor(pos.z / conf.gridSize));
-                int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
-                groups.phase[color].push_back(actor);
-            }
-        }
+    for (Actor* actor : list) {
+        if (!actor) continue;
+        auto const& pos = actor->getPosition();
+        int gx    = static_cast<int>(std::floor(pos.x / conf.gridSize));
+        int gz    = static_cast<int>(std::floor(pos.z / conf.gridSize));
+        int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
+        groups.phase[color].push_back(actor);
     }
 
     if (conf.debug) {
         pt.addStats(
             (int)groups.phase[0].size(), (int)groups.phase[1].size(),
-            (int)groups.phase[2].size(), (int)groups.phase[3].size(),
-            (int)groups.unsafe.size()
+            (int)groups.phase[2].size(), (int)groups.phase[3].size(), 0
         );
     }
 
-    // 并行阶段
+    auto& pool = pt.getPool();
+
+    // 逐 phase 提交，phase 内并行，phase 间串行
     for (int p = 0; p < 4; ++p) {
-        auto& list = groups.phase[p];
-        if (list.empty()) continue;
+        auto& phaseList = groups.phase[p];
+        if (phaseList.empty()) continue;
 
-        std::vector<std::future<void>> futures;
-
-        for (size_t i = 0; i < list.size(); i += conf.batchSize) {
-            size_t  end        = std::min(i + static_cast<size_t>(conf.batchSize), list.size());
-            Actor** batchBegin = list.data() + i;
+        for (size_t i = 0; i < phaseList.size(); i += conf.batchSize) {
+            size_t  end        = std::min(i + (size_t)conf.batchSize, phaseList.size());
+            Actor** batchBegin = phaseList.data() + i;
             size_t  batchCount = end - i;
 
-            futures.push_back(std::async(std::launch::async,
-                [&pt, &conf, batchBegin, batchCount]() {
-                    std::shared_lock lock(pt.getLifecycleMutex());
-                    for (size_t j = 0; j < batchCount; ++j) {
-                        Actor* actor = batchBegin[j];
-                        if (!actor) continue;
-
-                        if (conf.debug) {
-                            auto typeId   = (int)actor->getEntityTypeId();
-                            auto entityId = actor->getRuntimeID().rawID;
-                            pt.getSelf().getLogger().info(
-                                "Ticking typeId={} id={}", typeId, entityId
-                            );
-                            actor->normalTick();
-                            pt.getSelf().getLogger().info(
-                                "Done    typeId={} id={}", typeId, entityId
-                            );
-                        } else {
-                            actor->normalTick();
-                        }
+            pool.submit([&pt, &conf, batchBegin, batchCount] {
+                std::shared_lock lock(pt.getLifecycleMutex());
+                for (size_t j = 0; j < batchCount; ++j) {
+                    Actor* actor = batchBegin[j];
+                    if (!actor) continue;
+                    if (conf.debug) {
+                        auto typeId   = (int)actor->getEntityTypeId();
+                        auto entityId = actor->getRuntimeID().rawID;
+                        pt.getSelf().getLogger().info("Ticking typeId={} id={}", typeId, entityId);
+                        actor->normalTick();
+                        pt.getSelf().getLogger().info("Done    typeId={} id={}", typeId, entityId);
+                    } else {
+                        actor->normalTick();
                     }
                 }
-            ));
+            });
         }
 
-        for (auto& f : futures) f.get();
-    }
-
-    // 串行阶段
-    for (auto* actor : groups.unsafe) {
-        if (!actor) continue;
-
-        if (conf.debug) {
-            auto typeId   = (int)actor->getEntityTypeId();
-            auto entityId = actor->getRuntimeID().rawID;
-            pt.getSelf().getLogger().info(
-                "Serial typeId={} id={}", typeId, entityId
-            );
-            actor->normalTick();
-            pt.getSelf().getLogger().info(
-                "Serial Done typeId={} id={}", typeId, entityId
-            );
-        } else {
-            actor->normalTick();
-        }
+        pool.waitAll(); // phase 结束后等所有 batch 完成再进下一 phase
     }
 }
-#pragma warning(pop)
 
 LL_REGISTER_MOD(parallel_tick::ParallelTick, parallel_tick::ParallelTick::getInstance());
