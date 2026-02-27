@@ -21,24 +21,25 @@ struct ActorTickEntry { Actor* actor; BlockSource* region; };
 
 struct GridPos {
     int x, z;
-    bool operator==(const GridPos& o) const { return x==o.x && z==o.z; }
+    bool operator==(const GridPos& o) const { return x == o.x && z == o.z; }
 };
 struct GridPosHash {
     size_t operator()(const GridPos& p) const {
-        return std::hash<int>()(p.x)*2654435761u ^ std::hash<int>()(p.z)*2246822519u;
+        return std::hash<int>()(p.x) * 2654435761u ^ std::hash<int>()(p.z) * 2246822519u;
     }
 };
 inline int gridColor(const GridPos& gp) {
-    return (((gp.x%2)+2)%2)*2 + (((gp.z%2)+2)%2);
+    return (((gp.x % 2) + 2) % 2) * 2 + (((gp.z % 2) + 2) % 2);
 }
 
 void registerHooks();
 void unregisterHooks();
+void registerECSHooks();
+void unregisterECSHooks();
 
-// 全局锁：保护 Level 实体列表等跨维度共享状态
 class GlobalLocks {
 public:
-    std::mutex entityLifecycleLock;  // addEntity / removeEntity
+    std::mutex entityLifecycleLock;
     static GlobalLocks& get() { static GlobalLocks s; return s; }
 };
 
@@ -60,7 +61,7 @@ public:
 
     void collectActor(Actor* a, BlockSource& r) {
         std::lock_guard<std::mutex> lk(mMtx);
-        mQueue.push_back({a,&r}); mLive.insert(a);
+        mQueue.push_back({a, &r}); mLive.insert(a);
     }
     std::vector<ActorTickEntry> takeQueue() {
         std::lock_guard<std::mutex> lk(mMtx);
@@ -72,7 +73,7 @@ public:
     }
     bool isActorSafeToTick(Actor* a) {
         std::lock_guard<std::mutex> lk(mMtx);
-        return mLive.count(a)>0 && mCrashed.count(a)==0;
+        return mLive.count(a) > 0 && mCrashed.count(a) == 0;
     }
     void clearAll() {
         std::lock_guard<std::mutex> lk(mMtx);
@@ -85,11 +86,11 @@ public:
     }
     bool isPermanentlyCrashed(Actor* a) {
         std::lock_guard<std::mutex> lk(mMtx);
-        return mCrashed.count(a)>0;
+        return mCrashed.count(a) > 0;
     }
 
-    bool isParallelPhase() const { return mParallel.load(std::memory_order_acquire); }
-    void setParallelPhase(bool v){ mParallel.store(v, std::memory_order_release); }
+    bool isParallelPhase() const  { return mParallel.load(std::memory_order_acquire); }
+    void setParallelPhase(bool v) { mParallel.store(v, std::memory_order_release); }
 
     void addStats(size_t total, size_t tasks) {
         mStatTotal.fetch_add(total); mStatTasks.fetch_add(tasks);
@@ -101,18 +102,18 @@ private:
     void stopStatsTask();
 
     ll::mod::NativeMod& mSelf;
-    Config mConfig;
+    Config              mConfig;
     std::unique_ptr<FixedThreadPool> mPool;
 
-    std::mutex mMtx;
-    std::atomic<bool> mCollecting{false};
-    std::vector<ActorTickEntry> mQueue;
-    std::unordered_set<Actor*> mLive;
-    std::unordered_set<Actor*> mCrashed;
+    std::mutex                    mMtx;
+    std::atomic<bool>             mCollecting{false};
+    std::vector<ActorTickEntry>   mQueue;
+    std::unordered_set<Actor*>    mLive;
+    std::unordered_set<Actor*>    mCrashed;
 
-    std::atomic<bool> mParallel{false};
-    std::atomic<size_t> mStatTotal{0}, mStatTasks{0}, mCrashCount{0};
-    std::atomic<bool> mStatsRunning{false};
+    std::atomic<bool>             mParallel{false};
+    std::atomic<size_t>           mStatTotal{0}, mStatTasks{0}, mCrashCount{0};
+    std::atomic<bool>             mStatsRunning{false};
 };
 
 } // namespace parallel_tick
