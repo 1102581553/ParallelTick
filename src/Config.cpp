@@ -3,6 +3,7 @@
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 #include <string>
+#include <filesystem>
 
 namespace parallel_tick {
 
@@ -17,13 +18,20 @@ bool loadConfig() {
     auto& logger = ll::mod::NativeMod::current()->getLogger();
     try {
         if (!ll::config::loadConfig(configInstance, CONFIG_PATH)) {
-            // 文件不存在则创建默认配置
-            ll::config::saveConfig(configInstance, CONFIG_PATH);
+            // 文件不存在，创建默认配置
+            std::filesystem::path configDir = std::filesystem::path(CONFIG_PATH).parent_path();
+            if (!configDir.empty() && !std::filesystem::exists(configDir)) {
+                std::filesystem::create_directories(configDir);
+            }
+            if (!ll::config::saveConfig(configInstance, CONFIG_PATH)) {
+                logger.error("Failed to save default config to {}", CONFIG_PATH);
+                return false;
+            }
             logger.info("Created default config at {}", CONFIG_PATH);
         } else {
             logger.info("Loaded config from {}", CONFIG_PATH);
         }
-        // 版本检查（可选）
+        // 版本检查
         if (configInstance.version != 2) {
             logger.warn("Config version mismatch, some settings may be reset.");
         }
