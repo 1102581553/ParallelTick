@@ -18,6 +18,9 @@ struct ActorTickEntry {
     BlockSource* region;
 };
 
+void registerHooks();
+void unregisterHooks();
+
 class ParallelTick {
 public:
     static ParallelTick& getInstance();
