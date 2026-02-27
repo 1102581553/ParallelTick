@@ -16,7 +16,7 @@ namespace parallel_tick {
 
 struct ActorTickEntry {
     Actor*       actor;
-    BlockSource* region;
+    BlockSource* region;  // 仅用于收集阶段，并行任务中不再使用
 };
 
 void registerHooks();
@@ -53,6 +53,11 @@ public:
         mLiveActors.erase(actor);
     }
 
+    // 不加锁版本，供已持有写锁的调用者使用
+    void unsafeOnActorRemoved(Actor* actor) {
+        mLiveActors.erase(actor);
+    }
+
     // 检查实体是否存活（读锁保护）
     bool isActorAlive(Actor* actor) {
         std::shared_lock lock(mLifecycleMutex);
@@ -86,7 +91,7 @@ private:
 
     ll::mod::NativeMod&             mSelf;
     Config                          mConfig;
-    // 读写锁，保护 mPendingQueue 和 mLiveActors（移除 mQueueMutex）
+    // 读写锁，保护 mPendingQueue 和 mLiveActors
     std::shared_mutex               mLifecycleMutex;
     FixedThreadPool                 mPool;
 
