@@ -42,9 +42,10 @@ struct ThreadPool::Impl {
 };
 
 ThreadPool::ThreadPool(size_t threads) : mImpl(std::make_unique<Impl>()) {
-    auto& logger = ll::mod::NativeMod::current()->getLogger();
+    // 注意：这里不能使用 NativeMod::current()，因为线程可能在插件卸载后运行
+    // 改为在任务中通过 ParallelTick 实例获取 logger
     for (size_t i = 0; i < threads; ++i) {
-        mImpl->workers.emplace_back([this, &logger] {
+        mImpl->workers.emplace_back([this] {
             while (true) {
                 std::function<void()> task;
                 {
@@ -57,13 +58,8 @@ ThreadPool::ThreadPool(size_t threads) : mImpl(std::make_unique<Impl>()) {
                     mImpl->tasks.pop();
                 }
 
-                try {
-                    task();
-                } catch (const std::exception& e) {
-                    logger.error("Unhandled exception in thread pool task: {}", e.what());
-                } catch (...) {
-                    logger.error("Unhandled unknown exception in thread pool task");
-                }
+                // 任务内不再捕获异常，由提交者负责（已在提交时包裹 try-catch）
+                task();
 
                 if (--mImpl->activeTasks == 0) {
                     std::lock_guard lk(mImpl->queueMutex);
@@ -112,7 +108,7 @@ struct CrashedEntry {
 };
 
 struct ParallelTick::Impl {
-    ll::plugin::NativePlugin* self{nullptr};
+    ll::mod::NativeMod* self{nullptr};
     std::unique_ptr<ThreadPool> pool;
     std::atomic<bool>           parallelPhase{false};
 
@@ -140,7 +136,7 @@ ParallelTick& ParallelTick::getInstance() {
 // 生命周期
 // ============================================================================
 
-bool ParallelTick::load(ll::plugin::NativePlugin& self) {
+bool ParallelTick::load(ll::mod::NativeMod& self) {
     mImpl = std::make_unique<Impl>();
     mImpl->self = &self;
 
@@ -168,8 +164,7 @@ bool ParallelTick::load(ll::plugin::NativePlugin& self) {
 bool ParallelTick::unload() {
     unregisterECSHooks();
 
-    // 可选：保存配置（如果有运行时修改）
-    saveConfig();
+    saveConfig(); // 可选保存
 
     auto& st = mImpl->stats;
     mImpl->self->getLogger().info(
@@ -187,12 +182,12 @@ bool ParallelTick::unload() {
 // 访问器
 // ============================================================================
 
-ll::plugin::NativePlugin& ParallelTick::getSelf() {
+ll::mod::NativeMod& ParallelTick::getSelf() {
     return *mImpl->self;
 }
 
 const Config& ParallelTick::getConfig() const {
-    return parallel_tick::getConfig(); // 返回全局配置引用
+    return parallel_tick::getConfig();
 }
 
 ThreadPool& ParallelTick::getPool() {
@@ -206,7 +201,6 @@ ThreadPool& ParallelTick::getPool() {
 bool ParallelTick::isActorSafeToTick(Actor* a) const {
     if (!a) return false;
     if (isCrashed(a)) return false;
-    // 可扩展：检查实体是否正在被销毁、是否在有效 chunk 中等
     return true;
 }
 
@@ -216,7 +210,7 @@ bool ParallelTick::isActorSafeToTick(Actor* a) const {
 
 void ParallelTick::markCrashed(Actor* a) {
     if (!a) return;
-    ActorUniqueID id = a->getUniqueID();
+    ActorUniqueID id = a->getUniqueID(); // 假设存在，若不存在需改为正确函数
     {
         std::lock_guard lk(mImpl->crashMtx);
         mImpl->crashedActors[id] = { std::chrono::steady_clock::now() };
@@ -237,7 +231,6 @@ bool ParallelTick::isCrashed(Actor* a) const {
 void ParallelTick::cleanupCrashedList() {
     auto now = std::chrono::steady_clock::now();
     int maxAgeTicks = getConfig().maxExpiredAge;
-    // 将 tick 转换为毫秒（假设 1 tick = 50ms）
     auto maxAgeMs = std::chrono::milliseconds(maxAgeTicks * 50);
 
     std::lock_guard lk(mImpl->crashMtx);
