@@ -9,6 +9,7 @@
 #include <mc/server/ServerLevel.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorType.h>
+#include <mc/world/level/BlockSource.h>
 #include <mc/deps/ecs/gamerefs_entity/EntityContext.h>
 #include <mc/deps/ecs/gamerefs_entity/GameRefsEntity.h>
 #include <mc/deps/ecs/WeakEntityRef.h>
@@ -111,34 +112,30 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     return origin(std::move(entityRef));
 }
 
-// --- normalTick 拦截 Hook ---
+// --- Actor::tick 拦截 Hook ---
 
 LL_AUTO_TYPE_INSTANCE_HOOK(
-    ParallelNormalTickHook,
+    ParallelActorTickHook,
     ll::memory::HookPriority::Normal,
     Actor,
-    &Actor::$normalTick,
-    void
+    &Actor::tick,
+    bool,
+    ::BlockSource& region
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto& conf = pt.getConfig();
 
-    pt.getSelf().getLogger().info(
-        "NormalTick hook hit, collecting={}, isPlayer={}",
-        pt.isCollecting(), this->isPlayer()
-    );
-
     if (!conf.enabled || !pt.isCollecting()) {
-        origin();
-        return;
+        return origin(region);
     }
 
     if (this->isPlayer() || this->isSimulatedPlayer()) {
-        origin();
-        return;
+        return origin(region);
     }
 
-    pt.collectActor(this);
+    // 收集实体和它的 BlockSource，延迟到并行阶段执行
+    pt.collectActor(this, region);
+    return true; // 假装 tick 成功，实际在并行阶段执行
 }
 
 // --- 并行派发核心 Hook ---
@@ -152,8 +149,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 ) {
     auto& pt   = parallel_tick::ParallelTick::getInstance();
     auto  conf = pt.getConfig();
-
-    pt.getSelf().getLogger().info("tickEntities called"); // 临时
 
     if (!conf.enabled) {
         origin();
@@ -172,15 +167,15 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
     if (list.empty()) return;
 
-    struct Groups { std::vector<Actor*> phase[4]; } groups;
+    struct Groups { std::vector<parallel_tick::ActorTickEntry> phase[4]; } groups;
 
-    for (Actor* actor : list) {
-        if (!actor) continue;
-        auto const& pos = actor->getPosition();
+    for (auto& entry : list) {
+        if (!entry.actor) continue;
+        auto const& pos = entry.actor->getPosition();
         int gx    = static_cast<int>(std::floor(pos.x / conf.gridSize));
         int gz    = static_cast<int>(std::floor(pos.z / conf.gridSize));
         int color = (std::abs(gx) % 2) | ((std::abs(gz) % 2) << 1);
-        groups.phase[color].push_back(actor);
+        groups.phase[color].push_back(entry);
     }
 
     if (conf.debug) {
@@ -197,27 +192,23 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         if (phaseList.empty()) continue;
 
         for (size_t i = 0; i < phaseList.size(); i += conf.batchSize) {
-            size_t  end        = std::min(i + (size_t)conf.batchSize, phaseList.size());
-            Actor** batchBegin = phaseList.data() + i;
-            size_t  batchCount = end - i;
+            size_t end        = std::min(i + (size_t)conf.batchSize, phaseList.size());
+            auto*  batchBegin = phaseList.data() + i;
+            size_t batchCount = end - i;
 
             pool.submit([&pt, conf, batchBegin, batchCount] {
                 std::shared_lock lock(pt.getLifecycleMutex());
                 for (size_t j = 0; j < batchCount; ++j) {
-                    Actor* actor = batchBegin[j];
-                    if (!actor) continue;
+                    auto& entry = batchBegin[j];
+                    if (!entry.actor) continue;
                     if (conf.debug) {
-                        auto typeId   = (int)actor->getEntityTypeId();
-                        auto entityId = actor->getRuntimeID().rawID;
-                        pt.getSelf().getLogger().info(
-                            "Ticking typeId={} id={}", typeId, entityId
-                        );
-                        actor->normalTick();
-                        pt.getSelf().getLogger().info(
-                            "Done    typeId={} id={}", typeId, entityId
-                        );
+                        auto typeId   = (int)entry.actor->getEntityTypeId();
+                        auto entityId = entry.actor->getRuntimeID().rawID;
+                        pt.getSelf().getLogger().info("Ticking typeId={} id={}", typeId, entityId);
+                        entry.actor->tick(*entry.region);
+                        pt.getSelf().getLogger().info("Done    typeId={} id={}", typeId, entityId);
                     } else {
-                        actor->normalTick();
+                        entry.actor->tick(*entry.region);
                     }
                 }
             });
