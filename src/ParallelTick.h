@@ -9,8 +9,14 @@
 #include "FixedThreadPool.h"
 
 class Actor;
+class BlockSource;
 
 namespace parallel_tick {
+
+struct ActorTickEntry {
+    Actor*       actor;
+    BlockSource* region;
+};
 
 class ParallelTick {
 public:
@@ -26,16 +32,16 @@ public:
     bool enable();
     bool disable();
 
-    Config&            getConfig()          { return mConfig; }
-    std::shared_mutex& getLifecycleMutex()  { return mLifecycleMutex; }
-    FixedThreadPool&   getPool()            { return mPool; }
+    Config&            getConfig()         { return mConfig; }
+    std::shared_mutex& getLifecycleMutex() { return mLifecycleMutex; }
+    FixedThreadPool&   getPool()           { return mPool; }
 
-    void collectActor(Actor* actor) {
+    void collectActor(Actor* actor, BlockSource& region) {
         std::lock_guard lock(mQueueMutex);
-        mPendingQueue.push_back(actor);
+        mPendingQueue.push_back({actor, &region});
     }
 
-    std::vector<Actor*> takeQueue() {
+    std::vector<ActorTickEntry> takeQueue() {
         std::lock_guard lock(mQueueMutex);
         return std::move(mPendingQueue);
     }
@@ -53,18 +59,18 @@ private:
     void startDebugTask();
     void stopDebugTask();
 
-    ll::mod::NativeMod&  mSelf;
-    Config               mConfig;
-    std::shared_mutex    mLifecycleMutex;
-    FixedThreadPool      mPool;
+    ll::mod::NativeMod&         mSelf;
+    Config                      mConfig;
+    std::shared_mutex           mLifecycleMutex;
+    FixedThreadPool             mPool;
 
-    std::atomic<bool>    mCollecting{false};
-    std::mutex           mQueueMutex;
-    std::vector<Actor*>  mPendingQueue;
+    std::atomic<bool>           mCollecting{false};
+    std::mutex                  mQueueMutex;
+    std::vector<ActorTickEntry> mPendingQueue;
 
-    std::atomic<size_t>  mPhaseStats[4] = {0, 0, 0, 0};
-    std::atomic<size_t>  mUnsafeStats   = 0;
-    std::atomic<bool>    mDebugTaskRunning{false};
+    std::atomic<size_t>         mPhaseStats[4] = {0, 0, 0, 0};
+    std::atomic<size_t>         mUnsafeStats   = 0;
+    std::atomic<bool>           mDebugTaskRunning{false};
 };
 
 } // namespace parallel_tick
