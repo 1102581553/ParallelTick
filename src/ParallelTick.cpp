@@ -140,22 +140,6 @@ ParallelTick& ParallelTick::getInstance() {
 }
 
 // ============================================================================
-// 配置管理（成员函数，使用 getSelf()）
-// ============================================================================
-
-bool ParallelTick::loadConfig() {
-    auto& self = getSelf();
-    auto configPath = self.getConfigDir() / "parallel_tick.json";
-    return ll::config::loadConfig(parallel_tick::getConfig(), configPath);
-}
-
-bool ParallelTick::saveConfig() {
-    auto& self = getSelf();
-    auto configPath = self.getConfigDir() / "parallel_tick.json";
-    return ll::config::saveConfig(parallel_tick::getConfig(), configPath);
-}
-
-// ============================================================================
 // 生命周期
 // ============================================================================
 
@@ -166,17 +150,33 @@ bool ParallelTick::load(ll::mod::NativeMod& self) {
     // 确保配置目录存在
     std::filesystem::create_directories(self.getConfigDir());
 
-    // 加载配置，如果失败则保存默认配置
-    if (!loadConfig()) {
-        self.getLogger().warn("Failed to load config, using defaults and saving");
-        if (!saveConfig()) {
+    auto configPath = self.getConfigDir() / "parallel_tick.json";
+    auto& cfg = parallel_tick::getConfig();
+
+    // 显式检查配置文件是否存在
+    if (!std::filesystem::exists(configPath)) {
+        // 文件不存在，保存默认配置
+        self.getLogger().info("Config file not found, creating default config at {}", configPath.string());
+        if (!ll::config::saveConfig(cfg, configPath)) {
             self.getLogger().error("Failed to save default config");
         } else {
-            self.getLogger().info("Default config saved at {}/parallel_tick.json", self.getConfigDir().string());
+            self.getLogger().info("Default config saved successfully");
+        }
+    } else {
+        // 文件存在，尝试加载
+        self.getLogger().info("Loading config from {}", configPath.string());
+        if (!ll::config::loadConfig(cfg, configPath)) {
+            self.getLogger().warn("Failed to load config, using defaults");
+        } else {
+            self.getLogger().info("Config loaded successfully");
         }
     }
 
-    const auto& cfg = getConfig();
+    // 版本检查
+    if (cfg.version != 2) {
+        self.getLogger().warn("Config version mismatch (expected 2, got {}), some settings may be reset.", cfg.version);
+    }
+
     size_t nThreads = cfg.threadCount > 0
         ? static_cast<size_t>(cfg.threadCount)
         : std::max(1u, std::thread::hardware_concurrency() - 1);
@@ -204,7 +204,8 @@ bool ParallelTick::unload() {
     // 停止统计输出任务
     stopStatsTask();
 
-    saveConfig(); // 可选保存
+    // 可选保存配置（如果有运行时修改）
+    saveConfig();
 
     auto& st = mImpl->stats;
     mImpl->self->getLogger().info(
@@ -338,6 +339,16 @@ void ParallelTick::stopStatsTask() {
         mImpl->statsRunning = false;
         // 协程会在下一次 co_await 时检查标志并退出，无需手动销毁
     }
+}
+
+bool ParallelTick::loadConfig() {
+    auto configPath = getSelf().getConfigDir() / "parallel_tick.json";
+    return ll::config::loadConfig(parallel_tick::getConfig(), configPath);
+}
+
+bool ParallelTick::saveConfig() {
+    auto configPath = getSelf().getConfigDir() / "parallel_tick.json";
+    return ll::config::saveConfig(parallel_tick::getConfig(), configPath);
 }
 
 } // namespace parallel_tick
