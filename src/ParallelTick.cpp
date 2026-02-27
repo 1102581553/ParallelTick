@@ -1,5 +1,6 @@
 #include "ParallelTick.h"
 #include "Config.h"
+#include <ll/api/Config.h>
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 #include <ll/api/chrono/GameChrono.h>
@@ -139,6 +140,22 @@ ParallelTick& ParallelTick::getInstance() {
 }
 
 // ============================================================================
+// 配置管理（成员函数，使用 getSelf()）
+// ============================================================================
+
+bool ParallelTick::loadConfig() {
+    auto& self = getSelf();
+    auto configPath = self.getConfigDir() / "parallel_tick.json";
+    return ll::config::loadConfig(parallel_tick::getConfig(), configPath);
+}
+
+bool ParallelTick::saveConfig() {
+    auto& self = getSelf();
+    auto configPath = self.getConfigDir() / "parallel_tick.json";
+    return ll::config::saveConfig(parallel_tick::getConfig(), configPath);
+}
+
+// ============================================================================
 // 生命周期
 // ============================================================================
 
@@ -155,7 +172,7 @@ bool ParallelTick::load(ll::mod::NativeMod& self) {
         if (!saveConfig()) {
             self.getLogger().error("Failed to save default config");
         } else {
-            self.getLogger().info("Default config saved");
+            self.getLogger().info("Default config saved at {}/parallel_tick.json", self.getConfigDir().string());
         }
     }
 
