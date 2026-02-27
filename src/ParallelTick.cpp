@@ -95,7 +95,9 @@ LL_TYPE_INSTANCE_HOOK(
     ::OwnerPtr<::EntityContext>,
     ::Actor& actor
 ) {
-    std::unique_lock lock(parallel_tick::ParallelTick::getInstance().getLifecycleMutex());
+    auto& pt = parallel_tick::ParallelTick::getInstance();
+    pt.onActorRemoved(&actor);
+    std::unique_lock lock(pt.getLifecycleMutex());
     return origin(actor);
 }
 
@@ -136,7 +138,7 @@ LL_TYPE_INSTANCE_HOOK(
     return true;
 }
 
-// --- Level::$tick 外层 Hook，负责开关收集 + 并行派发 ---
+// --- Level::$tick 外层 Hook ---
 
 LL_TYPE_INSTANCE_HOOK(
     ParallelLevelTickHook,
@@ -157,7 +159,7 @@ LL_TYPE_INSTANCE_HOOK(
     origin();
     pt.setCollecting(false);
 
-    auto list = pt.takeQueue();
+    auto list = pt.takeQueue(); // takeQueue 同时清空 mLiveActors
 
     if (conf.debug) {
         pt.getSelf().getLogger().info("Queue size: {}", list.size());
@@ -165,12 +167,23 @@ LL_TYPE_INSTANCE_HOOK(
 
     if (list.empty()) return;
 
+    // 过滤掉已被删除的 actor（takeQueue 后 mLiveActors 已清空，
+    // 所以这里直接用 isRemoved 标志过滤）
+    std::vector<parallel_tick::ActorTickEntry> valid;
+    valid.reserve(list.size());
+    for (auto& e : list) {
+        if (e.actor && !e.actor->isRemoved()) {
+            valid.push_back(e);
+        }
+    }
+
+    if (valid.empty()) return;
+
     struct Groups {
         std::vector<parallel_tick::ActorTickEntry> phase[4];
     } groups;
 
-    for (auto& entry : list) {
-        if (!entry.actor) continue;
+    for (auto& entry : valid) {
         auto const& pos = entry.actor->getPosition();
         int gx    = static_cast<int>(std::floor(pos.x / conf.gridSize));
         int gz    = static_cast<int>(std::floor(pos.z / conf.gridSize));
@@ -200,7 +213,7 @@ LL_TYPE_INSTANCE_HOOK(
                 std::shared_lock lock(pt.getLifecycleMutex());
                 for (size_t j = 0; j < batchCount; ++j) {
                     auto& entry = batchBegin[j];
-                    if (!entry.actor) continue;
+                    if (!entry.actor || entry.actor->isRemoved()) continue;
                     if (conf.debug) {
                         auto typeId   = (int)entry.actor->getEntityTypeId();
                         auto entityId = entry.actor->getRuntimeID().rawID;
